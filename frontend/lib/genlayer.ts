@@ -3,21 +3,20 @@ import { studionet, testnetAsimov, localnet } from 'genlayer-js/chains';
 import type { TransactionStatus } from 'genlayer-js/types';
 
 const RPC_URL = process.env.NEXT_PUBLIC_GENLAYER_RPC_URL || 'http://localhost:4000/api';
-const CONTRACT_ADDRESS = process.env.NEXT_PUBLIC_CONTRACT_ADDRESS || '';
+const CONTRACT_ADDRESS = process.env.NEXT_PUBLIC_CONTRACT_ADDRESS || '0x2c9FDd983313701761e9DDBaFf2304acff3CD7bb';
 
 export type Market = {
-  market_id: number;
+  market_id: string;
   creator: string;
   asset: string;
   condition: string;
-  threshold: number;
-  resolution_timestamp: number;
-  yes_pool: number;
-  no_pool: number;
+  threshold: string;
+  resolution_timestamp: string;
+  yes_pool: string;
+  no_pool: string;
   resolved: boolean;
   outcome: string;
-  created_at: number;
-  resolution_price?: number;
+  resolution_price?: string;
 };
 
 export type MarketOdds = {
@@ -43,7 +42,6 @@ export type UserPosition = {
 
 class GenLayerClient {
   private client: ReturnType<typeof createClient> | null = null;
-  private account: ReturnType<typeof createAccount> | null = null;
   private walletAddress: string | null = null;
 
   private getChain() {
@@ -90,7 +88,6 @@ class GenLayerClient {
 
   async disconnectWallet(): Promise<void> {
     this.client = null;
-    this.account = null;
     this.walletAddress = null;
   }
 
@@ -102,27 +99,21 @@ class GenLayerClient {
     return this.walletAddress !== null;
   }
 
+  private async getReadClient() {
+    const readClient = createClient({
+      chain: this.getChain(),
+    });
+    await readClient.initializeConsensusSmartContract();
+    return readClient;
+  }
+
   async deductFee(amount: number = 0): Promise<boolean> {
     if (!this.client || !this.walletAddress) {
       throw new Error('Wallet not connected');
     }
 
     try {
-      // Send a zero-value transaction to verify wallet connection
-      // This acts as a "fee gate" before operations
-      const txHash = await this.client.writeContract({
-        address: CONTRACT_ADDRESS as `0x${string}`,
-        functionName: 'get_stats',
-        args: [],
-        value: BigInt(amount),
-      });
-
-      // Wait for transaction confirmation
-      await this.client.waitForTransactionReceipt({
-        hash: txHash,
-        status: 'ACCEPTED' as TransactionStatus,
-      });
-
+      await this.getStats();
       return true;
     } catch (error) {
       console.error('Fee deduction failed:', error);
@@ -130,105 +121,118 @@ class GenLayerClient {
     }
   }
 
-  async getActiveMarkets(): Promise<Market[]> {
-    if (!this.client) {
-      // Create read-only client
-      const readClient = createClient({
-        chain: this.getChain(),
-      });
-      await readClient.initializeConsensusSmartContract();
-      
-      const result = await readClient.readContract({
+  async getAllMarkets(): Promise<Market[]> {
+    const readClient = await this.getReadClient();
+    
+    try {
+      const idsResult = await readClient.readContract({
         address: CONTRACT_ADDRESS as `0x${string}`,
-        functionName: 'get_active_markets',
+        functionName: 'get_all_market_ids',
         args: [],
       });
       
-      return result as Market[];
+      const ids: string[] = JSON.parse(idsResult as string);
+      
+      const markets: Market[] = [];
+      for (const id of ids) {
+        try {
+          const marketResult = await readClient.readContract({
+            address: CONTRACT_ADDRESS as `0x${string}`,
+            functionName: 'get_market',
+            args: [id],
+          });
+          const market = JSON.parse(marketResult as string);
+          if (market.market_id) {
+            markets.push(market);
+          }
+        } catch (e) {
+          console.error(`Failed to fetch market ${id}:`, e);
+        }
+      }
+      
+      return markets;
+    } catch (error) {
+      console.error('Failed to get markets:', error);
+      return [];
     }
-
-    const result = await this.client.readContract({
-      address: CONTRACT_ADDRESS as `0x${string}`,
-      functionName: 'get_active_markets',
-      args: [],
-    });
-
-    return result as Market[];
   }
 
-  async getAllMarkets(): Promise<Market[]> {
-    const readClient = createClient({
-      chain: this.getChain(),
-    });
-    await readClient.initializeConsensusSmartContract();
+  async getActiveMarkets(): Promise<Market[]> {
+    const markets = await this.getAllMarkets();
+    const currentTime = Date.now() / 1000;
     
-    const result = await readClient.readContract({
-      address: CONTRACT_ADDRESS as `0x${string}`,
-      functionName: 'get_all_markets',
-      args: [],
-    });
-    
-    return result as Market[];
+    return markets.filter(m => 
+      !m.resolved && 
+      parseInt(m.resolution_timestamp) > currentTime
+    );
   }
 
-  async getMarket(marketId: number): Promise<Market> {
-    const readClient = createClient({
-      chain: this.getChain(),
-    });
-    await readClient.initializeConsensusSmartContract();
+  async getMarket(marketId: string): Promise<Market | null> {
+    const readClient = await this.getReadClient();
     
-    const result = await readClient.readContract({
-      address: CONTRACT_ADDRESS as `0x${string}`,
-      functionName: 'get_market',
-      args: [marketId],
-    });
-    
-    return result as Market;
+    try {
+      const result = await readClient.readContract({
+        address: CONTRACT_ADDRESS as `0x${string}`,
+        functionName: 'get_market',
+        args: [marketId],
+      });
+      
+      return JSON.parse(result as string);
+    } catch (error) {
+      console.error('Failed to get market:', error);
+      return null;
+    }
   }
 
-  async getMarketOdds(marketId: number): Promise<MarketOdds> {
-    const readClient = createClient({
-      chain: this.getChain(),
-    });
-    await readClient.initializeConsensusSmartContract();
+  async getMarketOdds(marketId: string): Promise<MarketOdds> {
+    const readClient = await this.getReadClient();
     
-    const result = await readClient.readContract({
-      address: CONTRACT_ADDRESS as `0x${string}`,
-      functionName: 'get_market_odds',
-      args: [marketId],
-    });
-    
-    return result as MarketOdds;
+    try {
+      const result = await readClient.readContract({
+        address: CONTRACT_ADDRESS as `0x${string}`,
+        functionName: 'get_market_odds',
+        args: [marketId],
+      });
+      
+      return JSON.parse(result as string);
+    } catch (error) {
+      console.error('Failed to get odds:', error);
+      return { yes_probability: 50, no_probability: 50, yes_pool: 0, no_pool: 0, total_pool: 0 };
+    }
   }
 
   async getStats(): Promise<PlatformStats> {
-    const readClient = createClient({
-      chain: this.getChain(),
-    });
-    await readClient.initializeConsensusSmartContract();
+    const readClient = await this.getReadClient();
     
-    const result = await readClient.readContract({
-      address: CONTRACT_ADDRESS as `0x${string}`,
-      functionName: 'get_stats',
-      args: [],
-    });
-    
-    return result as PlatformStats;
+    try {
+      const result = await readClient.readContract({
+        address: CONTRACT_ADDRESS as `0x${string}`,
+        functionName: 'get_stats',
+        args: [],
+      });
+      
+      return JSON.parse(result as string);
+    } catch (error) {
+      console.error('Failed to get stats:', error);
+      return { total_markets: 0, active_markets: 0, resolved_markets: 0, total_volume: 0, collected_fees: 0 };
+    }
   }
 
-  async getUserPosition(marketId: number, userAddress: string): Promise<UserPosition> {
-    const readClient = createClient({
-      chain: this.getChain(),
-    });
-    await readClient.initializeConsensusSmartContract();
+  async getUserPosition(marketId: string, userAddress: string): Promise<UserPosition> {
+    const readClient = await this.getReadClient();
     
-    const result = await readClient.readContract({
-      address: CONTRACT_ADDRESS as `0x${string}`,
-      functionName: 'get_user_position',
-      args: [marketId, userAddress],
-    });
-    
-    return result as UserPosition;
+    try {
+      const result = await readClient.readContract({
+        address: CONTRACT_ADDRESS as `0x${string}`,
+        functionName: 'get_user_position',
+        args: [marketId, userAddress],
+      });
+      
+      return JSON.parse(result as string);
+    } catch (error) {
+      console.error('Failed to get user position:', error);
+      return { YES: 0, NO: 0 };
+    }
   }
 
   async createMarket(
@@ -244,7 +248,7 @@ class GenLayerClient {
     const txHash = await this.client.writeContract({
       address: CONTRACT_ADDRESS as `0x${string}`,
       functionName: 'create_market',
-      args: [asset, condition, threshold, resolutionTimestamp],
+      args: [asset, condition, threshold.toString(), resolutionTimestamp.toString()],
       value: BigInt(0),
     });
 
@@ -256,7 +260,7 @@ class GenLayerClient {
     return txHash;
   }
 
-  async placeBet(marketId: number, position: 'YES' | 'NO', amount: bigint): Promise<string> {
+  async placeBet(marketId: string, position: 'YES' | 'NO', amount: bigint): Promise<string> {
     if (!this.client || !this.walletAddress) {
       throw new Error('Wallet not connected');
     }
@@ -276,7 +280,7 @@ class GenLayerClient {
     return txHash;
   }
 
-  async resolveMarket(marketId: number): Promise<string> {
+  async resolveMarket(marketId: string): Promise<string> {
     if (!this.client || !this.walletAddress) {
       throw new Error('Wallet not connected');
     }
@@ -295,7 +299,7 @@ class GenLayerClient {
     return txHash;
   }
 
-  async claimWinnings(marketId: number): Promise<string> {
+  async claimWinnings(marketId: string): Promise<string> {
     if (!this.client || !this.walletAddress) {
       throw new Error('Wallet not connected');
     }
@@ -315,10 +319,8 @@ class GenLayerClient {
   }
 }
 
-// Singleton instance
 export const genLayerClient = new GenLayerClient();
 
-// Type declaration for window.ethereum
 declare global {
   interface Window {
     ethereum?: {

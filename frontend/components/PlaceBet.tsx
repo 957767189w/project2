@@ -41,7 +41,6 @@ export function PlaceBet({ market, isOpen, onClose, onSuccess }: PlaceBetProps) 
 
   useEffect(() => {
     if (!isOpen) {
-      // Reset state when modal closes
       setStep('input');
       setAmount('');
       setError(null);
@@ -50,6 +49,9 @@ export function PlaceBet({ market, isOpen, onClose, onSuccess }: PlaceBetProps) 
   }, [isOpen]);
 
   if (!isOpen || !market) return null;
+
+  const threshold = parseFloat(market.threshold);
+  const resolutionTime = parseInt(market.resolution_timestamp);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -65,7 +67,6 @@ export function PlaceBet({ market, isOpen, onClose, onSuccess }: PlaceBetProps) 
       return;
     }
 
-    // First, attempt fee deduction (amount = 0 for this MVP)
     const feeDeducted = await deduct(0);
     if (!feeDeducted) {
       setError('Deduction failed');
@@ -138,7 +139,7 @@ export function PlaceBet({ market, isOpen, onClose, onSuccess }: PlaceBetProps) 
           <div className="bg-zinc-900/50 rounded-lg p-4 space-y-3 mb-6">
             <div className="flex justify-between">
               <span className="text-zinc-400">Market</span>
-              <span>{market.asset}/USD {market.condition} ${market.threshold}</span>
+              <span>{market.asset}/USD {market.condition} ${threshold}</span>
             </div>
             <div className="flex justify-between">
               <span className="text-zinc-400">Position</span>
@@ -194,7 +195,6 @@ export function PlaceBet({ market, isOpen, onClose, onSuccess }: PlaceBetProps) 
 
     return (
       <form onSubmit={handleSubmit} className="p-5 space-y-5">
-        {/* Market Info */}
         <div className="bg-zinc-900/50 rounded-lg p-4">
           <div className="flex items-center gap-3 mb-3">
             <div className="w-10 h-10 rounded-full bg-zinc-800 flex items-center justify-center text-xl font-bold text-primary-400">
@@ -203,7 +203,7 @@ export function PlaceBet({ market, isOpen, onClose, onSuccess }: PlaceBetProps) 
             <div>
               <h3 className="font-semibold">{market.asset}/USD</h3>
               <p className="text-sm text-zinc-400">
-                Expires {format(new Date(market.resolution_timestamp * 1000), 'MMM d, yyyy h:mm a')}
+                Expires {format(new Date(resolutionTime * 1000), 'MMM d, yyyy h:mm a')}
               </p>
             </div>
           </div>
@@ -212,11 +212,10 @@ export function PlaceBet({ market, isOpen, onClose, onSuccess }: PlaceBetProps) 
             <span className={market.condition === 'above' ? 'text-success-500' : 'text-danger-500'}>
               {market.condition}
             </span>{' '}
-            <span className="font-mono font-bold">${market.threshold.toLocaleString()}</span>
+            <span className="font-mono font-bold">${threshold.toLocaleString()}</span>
           </p>
         </div>
 
-        {/* Position Selection */}
         <div>
           <label className="label">Your Prediction</label>
           <div className="grid grid-cols-2 gap-3">
@@ -261,7 +260,6 @@ export function PlaceBet({ market, isOpen, onClose, onSuccess }: PlaceBetProps) 
           </div>
         </div>
 
-        {/* Amount Input */}
         <div>
           <label className="label">Bet Amount (GEN)</label>
           <input
@@ -283,7 +281,6 @@ export function PlaceBet({ market, isOpen, onClose, onSuccess }: PlaceBetProps) 
           )}
         </div>
 
-        {/* Error */}
         {(error || deductError) && (
           <div className="flex items-center gap-2 text-danger-500 bg-danger-500/10 rounded-lg p-3">
             <AlertCircle size={18} />
@@ -291,7 +288,6 @@ export function PlaceBet({ market, isOpen, onClose, onSuccess }: PlaceBetProps) 
           </div>
         )}
 
-        {/* Submit */}
         <button
           type="submit"
           disabled={isDeducting || !isConnected}

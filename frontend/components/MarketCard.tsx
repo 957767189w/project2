@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import { format, formatDistanceToNow } from 'date-fns';
-import { TrendingUp, TrendingDown, Clock, Users, DollarSign, ArrowRight } from 'lucide-react';
+import { TrendingUp, TrendingDown, Clock, DollarSign, ArrowRight } from 'lucide-react';
 import type { Market, MarketOdds } from '@/lib/genlayer';
 import { genLayerClient } from '@/lib/genlayer';
 
@@ -43,9 +43,10 @@ export function MarketCard({ market, onSelect }: MarketCardProps) {
     fetchOdds();
   }, [market.market_id]);
 
-  const isExpired = Date.now() / 1000 > market.resolution_timestamp;
-  const expiresIn = formatDistanceToNow(new Date(market.resolution_timestamp * 1000), { addSuffix: true });
-  const createdDate = format(new Date(market.created_at * 1000), 'MMM d, yyyy');
+  const resolutionTime = parseInt(market.resolution_timestamp);
+  const isExpired = Date.now() / 1000 > resolutionTime;
+  const expiresIn = formatDistanceToNow(new Date(resolutionTime * 1000), { addSuffix: true });
+  const threshold = parseFloat(market.threshold);
 
   const getStatusBadge = () => {
     if (market.resolved) {
@@ -82,7 +83,7 @@ export function MarketCard({ market, onSelect }: MarketCardProps) {
             <h3 className="font-semibold text-lg text-white group-hover:text-primary-400 transition-colors">
               {market.asset}/USD
             </h3>
-            <p className="text-sm text-zinc-500">Created {createdDate}</p>
+            <p className="text-sm text-zinc-500">Market #{market.market_id}</p>
           </div>
         </div>
         {getStatusBadge()}
@@ -99,7 +100,7 @@ export function MarketCard({ market, onSelect }: MarketCardProps) {
             )}
             {market.condition}
           </span>
-          <span className="font-mono font-bold text-white">${market.threshold.toLocaleString()}</span>
+          <span className="font-mono font-bold text-white">${threshold.toLocaleString()}</span>
         </p>
       </div>
 
