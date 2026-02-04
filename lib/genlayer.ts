@@ -1,14 +1,11 @@
 // GenLayer Client for GenPredict
-// Contract Address: 0x2c9FDd983313701761e9DDBaFf2304acff3CD7bb
+// Contract: 0x2c9FDd983313701761e9DDBaFf2304acff3CD7bb
 
 import { createClient } from 'genlayer-js';
-import { studionet, localnet } from 'genlayer-js/chains';
 
-// Configuration
-const CONTRACT_ADDRESS = process.env.NEXT_PUBLIC_CONTRACT_ADDRESS || '0x2c9FDd983313701761e9DDBaFf2304acff3CD7bb';
+const CONTRACT_ADDRESS = '0x2c9FDd983313701761e9DDBaFf2304acff3CD7bb';
 const RPC_URL = process.env.NEXT_PUBLIC_GENLAYER_RPC_URL || 'https://studio.genlayer.com/api';
 
-// Types
 export interface Market {
   market_id: string;
   creator: string;
@@ -37,18 +34,20 @@ export interface PlatformStats {
   total_volume: number;
 }
 
-// GenLayer Client Class
+// Custom chain configuration
+const customChain = {
+  id: 61999,
+  name: 'GenLayer Studio',
+  nativeCurrency: { name: 'GEN', symbol: 'GEN', decimals: 18 },
+  rpcUrls: {
+    default: { http: [RPC_URL] },
+  },
+};
+
 class GenLayerService {
   private client: ReturnType<typeof createClient> | null = null;
   private walletAddress: string | null = null;
   private initialized: boolean = false;
-
-  private getChain() {
-    if (RPC_URL.includes('localhost') || RPC_URL.includes('127.0.0.1')) {
-      return localnet;
-    }
-    return studionet;
-  }
 
   async connectWallet(): Promise<string> {
     if (typeof window === 'undefined') {
@@ -71,13 +70,18 @@ class GenLayerService {
       this.walletAddress = accounts[0];
 
       this.client = createClient({
-        chain: this.getChain(),
+        chain: customChain as any,
+        endpoint: RPC_URL,
         account: this.walletAddress,
       });
 
-      await this.client.initializeConsensusSmartContract();
+      try {
+        await this.client.initializeConsensusSmartContract();
+      } catch (e) {
+        console.warn('Consensus init warning:', e);
+      }
+      
       this.initialized = true;
-
       return this.walletAddress;
     } catch (error: any) {
       if (error.code === 4001) {
@@ -101,22 +105,19 @@ class GenLayerService {
     return this.walletAddress !== null && this.initialized;
   }
 
-  private async getReadOnlyClient() {
-    const readClient = createClient({
-      chain: this.getChain(),
+  private getReadOnlyClient() {
+    return createClient({
+      chain: customChain as any,
+      endpoint: RPC_URL,
     });
-    await readClient.initializeConsensusSmartContract();
-    return readClient;
   }
 
-  // Fee deduction check (amount = 0)
   async verifyWalletAccess(): Promise<boolean> {
     if (!this.walletAddress) {
       throw new Error('Wallet not connected');
     }
 
     try {
-      // Verify by reading contract state
       await this.getStats();
       return true;
     } catch (error) {
@@ -125,9 +126,8 @@ class GenLayerService {
     }
   }
 
-  // Read Methods
   async getStats(): Promise<PlatformStats> {
-    const client = await this.getReadOnlyClient();
+    const client = this.getReadOnlyClient();
     
     try {
       const result = await client.readContract({
@@ -149,7 +149,7 @@ class GenLayerService {
   }
 
   async getAllMarkets(): Promise<Market[]> {
-    const client = await this.getReadOnlyClient();
+    const client = this.getReadOnlyClient();
     
     try {
       const idsResult = await client.readContract({
@@ -186,7 +186,7 @@ class GenLayerService {
   }
 
   async getMarket(marketId: string): Promise<Market | null> {
-    const client = await this.getReadOnlyClient();
+    const client = this.getReadOnlyClient();
     
     try {
       const result = await client.readContract({
@@ -203,7 +203,7 @@ class GenLayerService {
   }
 
   async getMarketOdds(marketId: string): Promise<MarketOdds> {
-    const client = await this.getReadOnlyClient();
+    const client = this.getReadOnlyClient();
     
     try {
       const result = await client.readContract({
@@ -225,7 +225,6 @@ class GenLayerService {
     }
   }
 
-  // Write Methods
   async createMarket(
     asset: string,
     condition: string,
@@ -310,10 +309,8 @@ class GenLayerService {
   }
 }
 
-// Singleton export
 export const genLayer = new GenLayerService();
 
-// Window ethereum type
 declare global {
   interface Window {
     ethereum?: {
