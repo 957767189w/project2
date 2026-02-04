@@ -2,41 +2,35 @@
 @tailwind components;
 @tailwind utilities;
 
+* {
+  box-sizing: border-box;
+}
+
 body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  background: #09090b;
-  color: #fafafa;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  background: #08080c;
+  color: #ffffff;
 }
 
-.btn {
-  @apply inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg font-semibold text-sm transition-all disabled:opacity-50 disabled:cursor-not-allowed;
+::selection {
+  background: rgba(59, 130, 246, 0.3);
 }
 
-.btn-primary {
-  @apply bg-blue-600 text-white hover:bg-blue-700;
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
 }
 
-.btn-outline {
-  @apply border border-zinc-700 text-zinc-300 hover:bg-zinc-800;
+input[type="number"] {
+  -moz-appearance: textfield;
 }
 
-.card {
-  @apply bg-zinc-900 border border-zinc-800 rounded-xl p-5;
+select {
+  cursor: pointer;
 }
 
-.input {
-  @apply w-full bg-zinc-900 border border-zinc-700 rounded-lg px-4 py-3 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500;
+select option {
+  background: #12121a;
+  color: #ffffff;
 }
-
-.select {
-  @apply w-full bg-zinc-900 border border-zinc-700 rounded-lg px-4 py-3 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500;
-}
-
-.tag {
-  @apply inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold;
-}
-
-.tag-blue { @apply bg-blue-500/15 text-blue-400; }
-.tag-green { @apply bg-emerald-500/15 text-emerald-400; }
-.tag-red { @apply bg-red-500/15 text-red-400; }
-.tag-yellow { @apply bg-amber-500/15 text-amber-400; }
