@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { createClient } from 'genlayer-js';
 
 // ============ CONFIG ============
-const CONTRACT = '0x2c9FDd983313701761e9DDBaFf2304acff3CD7bb';
+const CONTRACT = '0x7d15C521f4A463Dc833d550e66635e9BE5063Eb4';
 // Use local GenLayer Studio by default
 const RPC = typeof window !== 'undefined' && window.location.hostname === 'localhost' 
   ? 'http://localhost:4000/api'
@@ -64,12 +64,68 @@ function getReadClient() {
   return createClient({ chain: chain as any, endpoint: RPC });
 }
 
+// Alternative: Direct JSON-RPC call for reading
+async function callContract(method: string, args: any[] = []): Promise<any> {
+  try {
+    const response = await fetch(RPC, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'call',
+        params: {
+          to: CONTRACT,
+          function: method,
+          args: args,
+        },
+        id: Date.now(),
+      }),
+    });
+    
+    const data = await response.json();
+    console.log(`RPC ${method} response:`, data);
+    
+    if (data.error) {
+      throw new Error(data.error.message || 'RPC error');
+    }
+    
+    // Parse result
+    let result = data.result;
+    if (typeof result === 'string') {
+      try {
+        result = JSON.parse(result);
+      } catch {}
+    }
+    
+    return result;
+  } catch (e) {
+    console.error(`RPC ${method} error:`, e);
+    throw e;
+  }
+}
+
 async function fetchStats(): Promise<Stats> {
+  try {
+    // Try direct RPC first
+    const result = await callContract('get_stats');
+    if (result && typeof result === 'object') {
+      return result as Stats;
+    }
+  } catch (e) {
+    console.warn('Direct RPC failed, trying SDK:', e);
+  }
+  
+  // Fallback to SDK
   try {
     const c = getReadClient();
     const r = await c.readContract({ address: CONTRACT as any, functionName: 'get_stats', args: [] });
-    console.log('Stats response:', r);
-    return JSON.parse(r as string);
+    console.log('Stats SDK response:', r);
+    
+    let data = r;
+    if (typeof r === 'string') {
+      try { data = JSON.parse(r); } catch {}
+    }
+    return data as Stats;
   } catch (e) {
     console.error('Failed to fetch stats:', e);
     return { total_markets: 0, active_markets: 0, resolved_markets: 0, total_volume: 0 };
@@ -78,15 +134,38 @@ async function fetchStats(): Promise<Stats> {
 
 async function fetchMarkets(): Promise<Market[]> {
   try {
-    const c = getReadClient();
-    const idsRaw = await c.readContract({ address: CONTRACT as any, functionName: 'get_all_market_ids', args: [] });
-    console.log('Market IDs raw:', idsRaw);
-    const ids = JSON.parse(idsRaw as string);
+    // Try direct RPC first
+    let ids: string[] = [];
+    try {
+      const idsResult = await callContract('get_all_market_ids');
+      ids = Array.isArray(idsResult) ? idsResult.map(String) : [];
+    } catch {
+      // Fallback to SDK
+      const c = getReadClient();
+      const idsRaw = await c.readContract({ address: CONTRACT as any, functionName: 'get_all_market_ids', args: [] });
+      if (typeof idsRaw === 'string') {
+        try { ids = JSON.parse(idsRaw); } catch {}
+      }
+    }
+    
+    console.log('Market IDs:', ids);
+    
     const markets: Market[] = [];
     for (const id of ids) {
       try {
-        const m = JSON.parse(await c.readContract({ address: CONTRACT as any, functionName: 'get_market', args: [id] }) as string);
-        if (m?.market_id) markets.push(m);
+        let m: any;
+        try {
+          m = await callContract('get_market', [id]);
+        } catch {
+          const c = getReadClient();
+          const mRaw = await c.readContract({ address: CONTRACT as any, functionName: 'get_market', args: [id] });
+          m = typeof mRaw === 'string' ? JSON.parse(mRaw) : mRaw;
+        }
+        
+        if (m?.market_id) {
+          markets.push(m);
+          console.log(`Market ${id}:`, m);
+        }
       } catch (e) {
         console.error(`Failed to fetch market ${id}:`, e);
       }
@@ -434,8 +513,14 @@ function CreateModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: (
       setStatus('Sending transaction...');
       const ts = Math.floor(Date.now() / 1000) + duration;
       await createMarket(asset, condition, priceValue, ts);
-      setStatus('Market created!');
-      setTimeout(() => onSuccess(), 1000);
+      setStatus('Market created! Refreshing...');
+      
+      // Wait a bit for blockchain to update, then refresh
+      setTimeout(() => {
+        onSuccess();
+        // Force page reload to get fresh data
+        window.location.reload();
+      }, 2000);
     } catch (e: any) {
       console.error('Create market error:', e);
       setError(e.message || 'Failed to create market. Check console for details.');
