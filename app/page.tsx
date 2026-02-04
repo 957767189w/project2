@@ -357,23 +357,28 @@ function MarketCard({ market, onClick }: { market: Market; onClick: () => void }
 function CreateModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
   const [asset, setAsset] = useState('BTC');
   const [condition, setCondition] = useState('above');
-  const [threshold, setThreshold] = useState('');
+  const [threshold, setThreshold] = useState('50000');
   const [duration, setDuration] = useState(86400);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!threshold) { setError('Enter threshold'); return; }
+    setError(null);
+    
+    const priceValue = parseFloat(threshold);
+    if (!threshold || isNaN(priceValue) || priceValue <= 0) {
+      setError('Please enter a valid price');
+      return;
+    }
     
     setSubmitting(true);
-    setError(null);
     try {
       const ts = Math.floor(Date.now() / 1000) + duration;
-      await createMarket(asset, condition, parseFloat(threshold), ts);
+      await createMarket(asset, condition, priceValue, ts);
       onSuccess();
     } catch (e: any) {
-      setError(e.message);
+      setError(e.message || 'Failed to create market');
     }
     setSubmitting(false);
   };
@@ -412,7 +417,17 @@ function CreateModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: (
 
           <div>
             <label className="block text-sm text-zinc-400 mb-1">Price (USD)</label>
-            <input type="number" value={threshold} onChange={e => setThreshold(e.target.value)} placeholder="100000" className="input" />
+            <input 
+              type="number" 
+              value={threshold} 
+              onChange={e => setThreshold(e.target.value)} 
+              className="input"
+              min="0"
+              step="any"
+            />
+            <p className="text-xs text-zinc-500 mt-1">
+              Predict if {asset} will be {condition} ${threshold || '0'} USD
+            </p>
           </div>
 
           <div>
@@ -424,7 +439,7 @@ function CreateModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: (
             </select>
           </div>
 
-          {error && <p className="text-red-400 text-sm">{error}</p>}
+          {error && <p className="text-red-400 text-sm bg-red-500/10 p-2 rounded">{error}</p>}
 
           <button type="submit" disabled={submitting} className="btn btn-primary w-full py-3">
             {submitting ? 'Creating...' : 'Create Market'}
