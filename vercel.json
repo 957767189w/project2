@@ -1,0 +1,10 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": ".next",
+  "framework": "nextjs",
+  "regions": ["iad1"],
+  "env": {
+    "NEXT_PUBLIC_CONTRACT_ADDRESS": "0x2c9FDd983313701761e9DDBaFf2304acff3CD7bb",
+    "NEXT_PUBLIC_GENLAYER_RPC_URL": "https://studio.genlayer.com/api"
+  }
+}
