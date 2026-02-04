@@ -5,7 +5,10 @@ import { createClient } from 'genlayer-js';
 
 // ============ CONFIG ============
 const CONTRACT = '0x2c9FDd983313701761e9DDBaFf2304acff3CD7bb';
-const RPC = 'https://studio.genlayer.com/api';
+// Use local GenLayer Studio by default
+const RPC = typeof window !== 'undefined' && window.location.hostname === 'localhost' 
+  ? 'http://localhost:4000/api'
+  : 'https://studio.genlayer.com/api';
 
 const chain = {
   id: 61999,
@@ -65,23 +68,34 @@ async function fetchStats(): Promise<Stats> {
   try {
     const c = getReadClient();
     const r = await c.readContract({ address: CONTRACT as any, functionName: 'get_stats', args: [] });
+    console.log('Stats response:', r);
     return JSON.parse(r as string);
-  } catch { return { total_markets: 0, active_markets: 0, resolved_markets: 0, total_volume: 0 }; }
+  } catch (e) {
+    console.error('Failed to fetch stats:', e);
+    return { total_markets: 0, active_markets: 0, resolved_markets: 0, total_volume: 0 };
+  }
 }
 
 async function fetchMarkets(): Promise<Market[]> {
   try {
     const c = getReadClient();
-    const ids = JSON.parse(await c.readContract({ address: CONTRACT as any, functionName: 'get_all_market_ids', args: [] }) as string);
+    const idsRaw = await c.readContract({ address: CONTRACT as any, functionName: 'get_all_market_ids', args: [] });
+    console.log('Market IDs raw:', idsRaw);
+    const ids = JSON.parse(idsRaw as string);
     const markets: Market[] = [];
     for (const id of ids) {
       try {
         const m = JSON.parse(await c.readContract({ address: CONTRACT as any, functionName: 'get_market', args: [id] }) as string);
         if (m?.market_id) markets.push(m);
-      } catch {}
+      } catch (e) {
+        console.error(`Failed to fetch market ${id}:`, e);
+      }
     }
     return markets.sort((a, b) => parseInt(b.market_id) - parseInt(a.market_id));
-  } catch { return []; }
+  } catch (e) {
+    console.error('Failed to fetch markets:', e);
+    return [];
+  }
 }
 
 async function fetchOdds(id: string): Promise<Odds> {
@@ -93,14 +107,25 @@ async function fetchOdds(id: string): Promise<Odds> {
 }
 
 async function createMarket(asset: string, condition: string, threshold: number, timestamp: number) {
-  if (!client) throw new Error('Not connected');
-  const tx = await client.writeContract({
-    address: CONTRACT as any,
-    functionName: 'create_market',
-    args: [asset, condition, threshold.toString(), timestamp.toString()],
-    value: BigInt(0),
-  });
-  await client.waitForTransactionReceipt({ hash: tx, status: 'FINALIZED' });
+  if (!client) throw new Error('Wallet not connected');
+  console.log('Creating market:', { asset, condition, threshold, timestamp });
+  
+  try {
+    const tx = await client.writeContract({
+      address: CONTRACT as any,
+      functionName: 'create_market',
+      args: [asset, condition, threshold.toString(), timestamp.toString()],
+      value: BigInt(0),
+    });
+    console.log('Transaction submitted:', tx);
+    
+    const receipt = await client.waitForTransactionReceipt({ hash: tx, status: 'FINALIZED' });
+    console.log('Transaction confirmed:', receipt);
+    return tx;
+  } catch (e: any) {
+    console.error('Create market error:', e);
+    throw new Error(e.message || 'Transaction failed - check if GenLayer Studio is running');
+  }
 }
 
 async function placeBet(id: string, position: string, amount: bigint) {
@@ -122,6 +147,7 @@ export default function Page() {
   const [markets, setMarkets] = useState<Market[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [networkStatus, setNetworkStatus] = useState<'checking' | 'connected' | 'error'>('checking');
   
   const [showCreate, setShowCreate] = useState(false);
   const [showBet, setShowBet] = useState(false);
@@ -129,9 +155,17 @@ export default function Page() {
 
   const load = useCallback(async () => {
     setLoading(true);
-    const [s, m] = await Promise.all([fetchStats(), fetchMarkets()]);
-    setStats(s);
-    setMarkets(m);
+    setNetworkStatus('checking');
+    try {
+      const [s, m] = await Promise.all([fetchStats(), fetchMarkets()]);
+      setStats(s);
+      setMarkets(m);
+      setNetworkStatus('connected');
+      console.log('Loaded:', { stats: s, markets: m });
+    } catch (e) {
+      console.error('Load error:', e);
+      setNetworkStatus('error');
+    }
     setLoading(false);
   }, []);
 
@@ -176,9 +210,18 @@ export default function Page() {
       {/* Header */}
       <header className="fixed top-0 left-0 right-0 z-50 bg-zinc-900/80 backdrop-blur border-b border-zinc-800">
         <div className="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-3">
             <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white font-bold text-sm">G</div>
             <span className="font-bold text-lg">Gen<span className="text-blue-400">Predict</span></span>
+            <span className={`text-xs px-2 py-0.5 rounded ${
+              networkStatus === 'connected' ? 'bg-green-500/20 text-green-400' :
+              networkStatus === 'error' ? 'bg-red-500/20 text-red-400' :
+              'bg-yellow-500/20 text-yellow-400'
+            }`}>
+              {networkStatus === 'connected' ? '● Connected' :
+               networkStatus === 'error' ? '● Offline' :
+               '● Checking...'}
+            </span>
           </div>
           
           {address ? (
@@ -241,6 +284,18 @@ export default function Page() {
 
           {/* Markets */}
           <h2 className="text-2xl font-bold mb-6">Prediction Markets</h2>
+          
+          {networkStatus === 'error' && (
+            <div className="bg-red-500/10 border border-red-500/20 rounded-xl p-6 mb-6 text-center">
+              <p className="text-red-400 font-semibold mb-2">Unable to connect to GenLayer</p>
+              <p className="text-zinc-400 text-sm mb-4">
+                Make sure GenLayer Studio is running at <code className="bg-zinc-800 px-2 py-0.5 rounded">localhost:4000</code>
+              </p>
+              <a href="https://docs.genlayer.com" target="_blank" rel="noopener" className="text-blue-400 text-sm hover:underline">
+                View Setup Guide →
+              </a>
+            </div>
+          )}
           
           {loading ? (
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -360,11 +415,13 @@ function CreateModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: (
   const [threshold, setThreshold] = useState('50000');
   const [duration, setDuration] = useState(86400);
   const [submitting, setSubmitting] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setStatus(null);
     
     const priceValue = parseFloat(threshold);
     if (!threshold || isNaN(priceValue) || priceValue <= 0) {
@@ -374,13 +431,16 @@ function CreateModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: (
     
     setSubmitting(true);
     try {
+      setStatus('Sending transaction...');
       const ts = Math.floor(Date.now() / 1000) + duration;
       await createMarket(asset, condition, priceValue, ts);
-      onSuccess();
+      setStatus('Market created!');
+      setTimeout(() => onSuccess(), 1000);
     } catch (e: any) {
-      setError(e.message || 'Failed to create market');
+      console.error('Create market error:', e);
+      setError(e.message || 'Failed to create market. Check console for details.');
+      setSubmitting(false);
     }
-    setSubmitting(false);
   };
 
   return (
@@ -439,10 +499,11 @@ function CreateModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: (
             </select>
           </div>
 
+          {status && <p className="text-blue-400 text-sm bg-blue-500/10 p-2 rounded">{status}</p>}
           {error && <p className="text-red-400 text-sm bg-red-500/10 p-2 rounded">{error}</p>}
 
           <button type="submit" disabled={submitting} className="btn btn-primary w-full py-3">
-            {submitting ? 'Creating...' : 'Create Market'}
+            {submitting ? 'Creating... (please wait)' : 'Create Market'}
           </button>
         </form>
       </div>
