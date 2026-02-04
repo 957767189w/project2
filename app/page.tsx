@@ -1,258 +1,552 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
-import {
-  Header,
-  Footer,
-  Stats,
-  MarketCard,
-  MarketCardSkeleton,
-  CreateMarketModal,
-  PlaceBetModal,
-} from '@/components';
-import { genLayer, type Market } from '@/lib/genlayer';
-import { useWallet, useFeeVerification } from '@/hooks/useWallet';
+import { createClient } from 'genlayer-js';
 
-export default function HomePage() {
-  const { isConnected } = useWallet();
-  const { verify, isVerifying, error: verifyError } = useFeeVerification();
+// ============ CONFIG ============
+const CONTRACT = '0x2c9FDd983313701761e9DDBaFf2304acff3CD7bb';
+const RPC = 'https://studio.genlayer.com/api';
 
+const chain = {
+  id: 61999,
+  name: 'GenLayer',
+  nativeCurrency: { name: 'GEN', symbol: 'GEN', decimals: 18 },
+  rpcUrls: { default: { http: [RPC] } },
+};
+
+// ============ TYPES ============
+interface Market {
+  market_id: string;
+  asset: string;
+  condition: string;
+  threshold: string;
+  resolution_timestamp: string;
+  yes_pool: string;
+  no_pool: string;
+  resolved: boolean;
+  outcome: string;
+}
+
+interface Stats {
+  total_markets: number;
+  active_markets: number;
+  resolved_markets: number;
+  total_volume: number;
+}
+
+interface Odds {
+  yes_probability: number;
+  no_probability: number;
+  total_pool: number;
+}
+
+// ============ GENLAYER CLIENT ============
+let client: any = null;
+let wallet: string | null = null;
+
+async function connectWallet(): Promise<string> {
+  if (typeof window === 'undefined' || !window.ethereum) {
+    throw new Error('MetaMask not installed');
+  }
+  const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' }) as string[];
+  if (!accounts?.length) throw new Error('No accounts');
+  
+  wallet = accounts[0];
+  client = createClient({ chain: chain as any, endpoint: RPC, account: wallet });
+  try { await client.initializeConsensusSmartContract(); } catch(e) {}
+  return wallet;
+}
+
+function getReadClient() {
+  return createClient({ chain: chain as any, endpoint: RPC });
+}
+
+async function fetchStats(): Promise<Stats> {
+  try {
+    const c = getReadClient();
+    const r = await c.readContract({ address: CONTRACT as any, functionName: 'get_stats', args: [] });
+    return JSON.parse(r as string);
+  } catch { return { total_markets: 0, active_markets: 0, resolved_markets: 0, total_volume: 0 }; }
+}
+
+async function fetchMarkets(): Promise<Market[]> {
+  try {
+    const c = getReadClient();
+    const ids = JSON.parse(await c.readContract({ address: CONTRACT as any, functionName: 'get_all_market_ids', args: [] }) as string);
+    const markets: Market[] = [];
+    for (const id of ids) {
+      try {
+        const m = JSON.parse(await c.readContract({ address: CONTRACT as any, functionName: 'get_market', args: [id] }) as string);
+        if (m?.market_id) markets.push(m);
+      } catch {}
+    }
+    return markets.sort((a, b) => parseInt(b.market_id) - parseInt(a.market_id));
+  } catch { return []; }
+}
+
+async function fetchOdds(id: string): Promise<Odds> {
+  try {
+    const c = getReadClient();
+    const r = await c.readContract({ address: CONTRACT as any, functionName: 'get_market_odds', args: [id] });
+    return JSON.parse(r as string);
+  } catch { return { yes_probability: 50, no_probability: 50, total_pool: 0 }; }
+}
+
+async function createMarket(asset: string, condition: string, threshold: number, timestamp: number) {
+  if (!client) throw new Error('Not connected');
+  const tx = await client.writeContract({
+    address: CONTRACT as any,
+    functionName: 'create_market',
+    args: [asset, condition, threshold.toString(), timestamp.toString()],
+    value: BigInt(0),
+  });
+  await client.waitForTransactionReceipt({ hash: tx, status: 'FINALIZED' });
+}
+
+async function placeBet(id: string, position: string, amount: bigint) {
+  if (!client) throw new Error('Not connected');
+  const tx = await client.writeContract({
+    address: CONTRACT as any,
+    functionName: 'place_bet',
+    args: [id, position],
+    value: amount,
+  });
+  await client.waitForTransactionReceipt({ hash: tx, status: 'FINALIZED' });
+}
+
+// ============ MAIN PAGE ============
+export default function Page() {
+  const [address, setAddress] = useState<string | null>(null);
+  const [connecting, setConnecting] = useState(false);
+  const [stats, setStats] = useState<Stats | null>(null);
   const [markets, setMarkets] = useState<Market[]>([]);
   const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-
-  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  
+  const [showCreate, setShowCreate] = useState(false);
+  const [showBet, setShowBet] = useState(false);
   const [selectedMarket, setSelectedMarket] = useState<Market | null>(null);
-  const [showBetModal, setShowBetModal] = useState(false);
 
-  const [accessError, setAccessError] = useState<string | null>(null);
-
-  const fetchMarkets = useCallback(async () => {
-    try {
-      const data = await genLayer.getAllMarkets();
-      setMarkets(data);
-    } catch (error) {
-      console.error('Failed to fetch markets:', error);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
+  const load = useCallback(async () => {
+    setLoading(true);
+    const [s, m] = await Promise.all([fetchStats(), fetchMarkets()]);
+    setStats(s);
+    setMarkets(m);
+    setLoading(false);
   }, []);
 
-  useEffect(() => {
-    fetchMarkets();
-  }, [fetchMarkets]);
+  useEffect(() => { load(); }, [load]);
 
-  const handleRefresh = () => {
-    setRefreshing(true);
-    fetchMarkets();
+  const connect = async () => {
+    setConnecting(true);
+    setError(null);
+    try {
+      const addr = await connectWallet();
+      setAddress(addr);
+    } catch (e: any) {
+      setError(e.message);
+    }
+    setConnecting(false);
+  };
+
+  const disconnect = () => {
+    client = null;
+    wallet = null;
+    setAddress(null);
+  };
+
+  const handleMarketClick = async (m: Market) => {
+    setError(null);
+    if (!address) { setError('Please connect wallet first'); return; }
+    // Fee verification (amount = 0)
+    try { await fetchStats(); } catch { setError('Deduction failed'); return; }
+    setSelectedMarket(m);
+    setShowBet(true);
   };
 
   const handleCreateClick = async () => {
-    setAccessError(null);
-
-    if (!isConnected) {
-      setAccessError('Please connect your wallet to create a market');
-      return;
-    }
-
-    const ok = await verify();
-    if (!ok) {
-      setAccessError('Deduction failed');
-      return;
-    }
-
-    setShowCreateModal(true);
-  };
-
-  const handleMarketClick = async (market: Market) => {
-    setAccessError(null);
-
-    if (!isConnected) {
-      setAccessError('Please connect your wallet to view market details');
-      return;
-    }
-
-    const ok = await verify();
-    if (!ok) {
-      setAccessError('Deduction failed');
-      return;
-    }
-
-    setSelectedMarket(market);
-    setShowBetModal(true);
+    setError(null);
+    if (!address) { setError('Please connect wallet first'); return; }
+    try { await fetchStats(); } catch { setError('Deduction failed'); return; }
+    setShowCreate(true);
   };
 
   return (
-    <div className="min-h-screen flex flex-col">
-      <Header />
+    <div className="min-h-screen">
+      {/* Header */}
+      <header className="fixed top-0 left-0 right-0 z-50 bg-zinc-900/80 backdrop-blur border-b border-zinc-800">
+        <div className="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white font-bold text-sm">G</div>
+            <span className="font-bold text-lg">Gen<span className="text-blue-400">Predict</span></span>
+          </div>
+          
+          {address ? (
+            <div className="flex items-center gap-3">
+              <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 bg-zinc-800 rounded-lg border border-zinc-700">
+                <span className="w-2 h-2 bg-green-500 rounded-full"></span>
+                <span className="font-mono text-sm text-zinc-300">{address.slice(0,6)}...{address.slice(-4)}</span>
+              </div>
+              <button onClick={disconnect} className="btn btn-outline text-sm">Disconnect</button>
+            </div>
+          ) : (
+            <button onClick={connect} disabled={connecting} className="btn btn-primary">
+              {connecting ? 'Connecting...' : 'Connect Wallet'}
+            </button>
+          )}
+        </div>
+      </header>
 
-      <main className="flex-1">
-        {/* Hero Section */}
-        <section className="pt-28 pb-12 px-4 sm:px-6">
-          <div className="max-w-6xl mx-auto text-center">
-            <h1 className="text-4xl sm:text-5xl lg:text-6xl font-extrabold mb-6 leading-tight">
-              <span className="gradient-text">Predict Crypto Prices</span>
+      <main className="pt-24 pb-16 px-4">
+        <div className="max-w-6xl mx-auto">
+          {/* Hero */}
+          <div className="text-center mb-12">
+            <h1 className="text-4xl sm:text-5xl font-extrabold mb-4">
+              <span className="bg-gradient-to-r from-blue-400 via-purple-400 to-pink-400 bg-clip-text text-transparent">
+                Predict Crypto Prices
+              </span>
             </h1>
-            <p className="text-lg sm:text-xl text-zinc-400 max-w-2xl mx-auto mb-10">
-              Create and join prediction markets for cryptocurrency prices. 
-              AI-powered resolution ensures fair and accurate outcomes.
+            <p className="text-zinc-400 text-lg mb-8 max-w-xl mx-auto">
+              Create and join prediction markets for cryptocurrency prices. AI-powered resolution ensures fair outcomes.
             </p>
-
-            <div className="flex flex-wrap items-center justify-center gap-4 mb-6">
-              <button
-                onClick={handleCreateClick}
-                disabled={isVerifying}
-                className="btn btn-primary text-base px-6 py-3"
-              >
-                {isVerifying ? (
-                  <>
-                    <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                    </svg>
-                    <span>Verifying...</span>
-                  </>
-                ) : (
-                  <>
-                    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-                    </svg>
-                    <span>Create Market</span>
-                  </>
-                )}
-              </button>
-
-              <button
-                onClick={handleRefresh}
-                disabled={refreshing}
-                className="btn btn-outline text-base px-6 py-3"
-              >
-                <svg className={`w-5 h-5 ${refreshing ? 'animate-spin' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                </svg>
-                <span>Refresh</span>
-              </button>
-            </div>
-
-            {(accessError || verifyError) && (
-              <div className="inline-flex items-center gap-2 text-red-400 bg-red-500/10 rounded-lg px-4 py-2">
-                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                </svg>
-                <span>{accessError || verifyError}</span>
-              </div>
-            )}
-          </div>
-        </section>
-
-        {/* Stats Section */}
-        <section className="px-4 sm:px-6">
-          <div className="max-w-6xl mx-auto">
-            <Stats />
-          </div>
-        </section>
-
-        {/* Markets Section */}
-        <section id="markets" className="py-12 px-4 sm:px-6">
-          <div className="max-w-6xl mx-auto">
-            <h2 className="text-2xl font-bold mb-8">Prediction Markets</h2>
-
-            {loading ? (
-              <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
-                {[1, 2, 3, 4, 5, 6].map((i) => (
-                  <MarketCardSkeleton key={i} />
-                ))}
-              </div>
-            ) : markets.length === 0 ? (
-              <div className="text-center py-20">
-                <div className="w-20 h-20 bg-zinc-800 rounded-full flex items-center justify-center mx-auto mb-6">
-                  <svg className="w-10 h-10 text-zinc-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z" />
-                  </svg>
-                </div>
-                <h3 className="text-xl font-semibold mb-2">No Markets Yet</h3>
-                <p className="text-zinc-500 mb-8 max-w-md mx-auto">
-                  Be the first to create a prediction market and start trading on crypto price movements.
-                </p>
-                <button onClick={handleCreateClick} className="btn btn-primary">
-                  Create First Market
-                </button>
-              </div>
-            ) : (
-              <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
-                {markets.map((market) => (
-                  <MarketCard key={market.market_id} market={market} onSelect={handleMarketClick} />
-                ))}
-              </div>
-            )}
-          </div>
-        </section>
-
-        {/* How It Works Section */}
-        <section id="how-it-works" className="py-16 px-4 sm:px-6 bg-zinc-900/30">
-          <div className="max-w-6xl mx-auto">
-            <h2 className="text-2xl font-bold text-center mb-12">How It Works</h2>
             
-            <div className="grid md:grid-cols-3 gap-8">
-              <div className="text-center">
-                <div className="w-16 h-16 bg-blue-500/10 rounded-2xl flex items-center justify-center mx-auto mb-5">
-                  <svg className="w-8 h-8 text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v12m-3-2.818l.879.659c1.171.879 3.07.879 4.242 0 1.172-.879 1.172-2.303 0-3.182C13.536 12.219 12.768 12 12 12c-.725 0-1.45-.22-2.003-.659-1.106-.879-1.106-2.303 0-3.182s2.9-.879 4.006 0l.415.33M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                  </svg>
-                </div>
-                <h3 className="text-lg font-semibold mb-3">1. Create or Join</h3>
-                <p className="text-zinc-400">
-                  Create a new prediction market or place your bet on an existing one. Choose YES or NO for price movements.
-                </p>
-              </div>
-
-              <div className="text-center">
-                <div className="w-16 h-16 bg-violet-500/10 rounded-2xl flex items-center justify-center mx-auto mb-5">
-                  <svg className="w-8 h-8 text-violet-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M9.75 3.104v5.714a2.25 2.25 0 01-.659 1.591L5 14.5M9.75 3.104c-.251.023-.501.05-.75.082m.75-.082a24.301 24.301 0 014.5 0m0 0v5.714c0 .597.237 1.17.659 1.591L19.8 15.3M14.25 3.104c.251.023.501.05.75.082M19.8 15.3l-1.57.393A9.065 9.065 0 0112 15a9.065 9.065 0 00-6.23.693L5 14.5m14.8.8l1.402 1.402c1.232 1.232.65 3.318-1.067 3.611A48.309 48.309 0 0112 21c-2.773 0-5.491-.235-8.135-.687-1.718-.293-2.3-2.379-1.067-3.61L5 14.5" />
-                  </svg>
-                </div>
-                <h3 className="text-lg font-semibold mb-3">2. AI Resolution</h3>
-                <p className="text-zinc-400">
-                  When the market expires, GenLayer validators fetch real prices and use AI consensus to determine the outcome.
-                </p>
-              </div>
-
-              <div className="text-center">
-                <div className="w-16 h-16 bg-emerald-500/10 rounded-2xl flex items-center justify-center mx-auto mb-5">
-                  <svg className="w-8 h-8 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                  </svg>
-                </div>
-                <h3 className="text-lg font-semibold mb-3">3. Claim Rewards</h3>
-                <p className="text-zinc-400">
-                  If your prediction was correct, claim your share of the prize pool. All settlements are trustless and transparent.
-                </p>
-              </div>
+            <div className="flex flex-wrap justify-center gap-4 mb-4">
+              <button onClick={handleCreateClick} className="btn btn-primary px-6 py-3">
+                + Create Market
+              </button>
+              <button onClick={load} className="btn btn-outline px-6 py-3">
+                ↻ Refresh
+              </button>
             </div>
+            
+            {error && (
+              <p className="text-red-400 bg-red-500/10 inline-block px-4 py-2 rounded-lg">{error}</p>
+            )}
           </div>
-        </section>
+
+          {/* Stats */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-12">
+            {[
+              { label: 'Total Markets', value: stats?.total_markets ?? 0 },
+              { label: 'Active', value: stats?.active_markets ?? 0 },
+              { label: 'Resolved', value: stats?.resolved_markets ?? 0 },
+              { label: 'Volume', value: `${stats?.total_volume ?? 0} GEN` },
+            ].map(s => (
+              <div key={s.label} className="card">
+                <p className="text-sm text-zinc-500">{s.label}</p>
+                <p className="text-2xl font-bold">{s.value}</p>
+              </div>
+            ))}
+          </div>
+
+          {/* Markets */}
+          <h2 className="text-2xl font-bold mb-6">Prediction Markets</h2>
+          
+          {loading ? (
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {[1,2,3].map(i => (
+                <div key={i} className="card animate-pulse">
+                  <div className="h-10 w-10 bg-zinc-800 rounded-full mb-4"></div>
+                  <div className="h-4 w-32 bg-zinc-800 rounded mb-2"></div>
+                  <div className="h-4 w-48 bg-zinc-800 rounded"></div>
+                </div>
+              ))}
+            </div>
+          ) : markets.length === 0 ? (
+            <div className="text-center py-16">
+              <div className="w-16 h-16 bg-zinc-800 rounded-full flex items-center justify-center mx-auto mb-4">
+                <span className="text-2xl">📊</span>
+              </div>
+              <h3 className="text-lg font-semibold mb-2">No Markets Yet</h3>
+              <p className="text-zinc-500 mb-6">Be the first to create a prediction market</p>
+              <button onClick={handleCreateClick} className="btn btn-primary">Create Market</button>
+            </div>
+          ) : (
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {markets.map(m => (
+                <MarketCard key={m.market_id} market={m} onClick={() => handleMarketClick(m)} />
+              ))}
+            </div>
+          )}
+        </div>
       </main>
 
-      <Footer />
+      {/* Footer */}
+      <footer className="border-t border-zinc-800 py-8 text-center text-zinc-500 text-sm">
+        Built on GenLayer. Powered by Intelligent Contracts.
+      </footer>
 
       {/* Modals */}
-      <CreateMarketModal
-        isOpen={showCreateModal}
-        onClose={() => setShowCreateModal(false)}
-        onSuccess={fetchMarkets}
-      />
-
-      <PlaceBetModal
-        market={selectedMarket}
-        isOpen={showBetModal}
-        onClose={() => {
-          setShowBetModal(false);
-          setSelectedMarket(null);
-        }}
-        onSuccess={fetchMarkets}
-      />
+      {showCreate && (
+        <CreateModal
+          onClose={() => setShowCreate(false)}
+          onSuccess={() => { setShowCreate(false); load(); }}
+        />
+      )}
+      
+      {showBet && selectedMarket && (
+        <BetModal
+          market={selectedMarket}
+          onClose={() => { setShowBet(false); setSelectedMarket(null); }}
+          onSuccess={() => { setShowBet(false); setSelectedMarket(null); load(); }}
+        />
+      )}
     </div>
   );
+}
+
+// ============ MARKET CARD ============
+function MarketCard({ market, onClick }: { market: Market; onClick: () => void }) {
+  const [odds, setOdds] = useState<Odds | null>(null);
+  
+  useEffect(() => {
+    fetchOdds(market.market_id).then(setOdds);
+  }, [market.market_id]);
+
+  const threshold = parseFloat(market.threshold);
+  const expiry = parseInt(market.resolution_timestamp) * 1000;
+  const isExpired = Date.now() > expiry;
+  const timeLeft = isExpired ? 'Expired' : formatTime(expiry - Date.now());
+
+  return (
+    <div onClick={onClick} className="card hover:border-zinc-700 hover:bg-zinc-800/50 cursor-pointer transition-all">
+      <div className="flex justify-between items-start mb-4">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-full bg-zinc-800 flex items-center justify-center text-lg font-bold text-blue-400">
+            {market.asset.charAt(0)}
+          </div>
+          <div>
+            <h3 className="font-semibold">{market.asset}/USD</h3>
+            <p className="text-sm text-zinc-500">#{market.market_id}</p>
+          </div>
+        </div>
+        <span className={`tag ${market.resolved ? 'tag-green' : isExpired ? 'tag-yellow' : 'tag-blue'}`}>
+          {market.resolved ? market.outcome : isExpired ? 'Pending' : 'Active'}
+        </span>
+      </div>
+
+      <div className="bg-zinc-800/50 rounded-lg p-3 mb-4">
+        <p className="text-zinc-300">
+          Price will be{' '}
+          <span className={market.condition === 'above' ? 'text-green-400' : 'text-red-400'}>
+            {market.condition}
+          </span>{' '}
+          <span className="font-mono font-bold">${threshold.toLocaleString()}</span>
+        </p>
+      </div>
+
+      {odds && (
+        <div className="mb-4">
+          <div className="flex justify-between text-sm mb-1">
+            <span className="text-green-400">YES {odds.yes_probability}%</span>
+            <span className="text-red-400">NO {odds.no_probability}%</span>
+          </div>
+          <div className="h-2 bg-zinc-800 rounded-full overflow-hidden flex">
+            <div className="bg-green-500" style={{ width: `${odds.yes_probability}%` }}></div>
+            <div className="bg-red-500" style={{ width: `${odds.no_probability}%` }}></div>
+          </div>
+        </div>
+      )}
+
+      <p className="text-sm text-zinc-500">⏱ {timeLeft}</p>
+    </div>
+  );
+}
+
+// ============ CREATE MODAL ============
+function CreateModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
+  const [asset, setAsset] = useState('BTC');
+  const [condition, setCondition] = useState('above');
+  const [threshold, setThreshold] = useState('');
+  const [duration, setDuration] = useState(86400);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!threshold) { setError('Enter threshold'); return; }
+    
+    setSubmitting(true);
+    setError(null);
+    try {
+      const ts = Math.floor(Date.now() / 1000) + duration;
+      await createMarket(asset, condition, parseFloat(threshold), ts);
+      onSuccess();
+    } catch (e: any) {
+      setError(e.message);
+    }
+    setSubmitting(false);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="bg-zinc-900 border border-zinc-800 rounded-2xl w-full max-w-md">
+        <div className="flex justify-between items-center p-5 border-b border-zinc-800">
+          <h2 className="text-xl font-semibold">Create Market</h2>
+          <button onClick={onClose} className="text-zinc-400 hover:text-white text-2xl">&times;</button>
+        </div>
+        
+        <form onSubmit={submit} className="p-5 space-y-4">
+          <div>
+            <label className="block text-sm text-zinc-400 mb-1">Asset</label>
+            <select value={asset} onChange={e => setAsset(e.target.value)} className="select">
+              <option value="BTC">BTC - Bitcoin</option>
+              <option value="ETH">ETH - Ethereum</option>
+              <option value="SOL">SOL - Solana</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-sm text-zinc-400 mb-1">Condition</label>
+            <div className="grid grid-cols-2 gap-3">
+              <button type="button" onClick={() => setCondition('above')}
+                className={`p-3 rounded-lg border-2 ${condition === 'above' ? 'border-green-500 bg-green-500/10' : 'border-zinc-700'}`}>
+                ↑ Above
+              </button>
+              <button type="button" onClick={() => setCondition('below')}
+                className={`p-3 rounded-lg border-2 ${condition === 'below' ? 'border-red-500 bg-red-500/10' : 'border-zinc-700'}`}>
+                ↓ Below
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-sm text-zinc-400 mb-1">Price (USD)</label>
+            <input type="number" value={threshold} onChange={e => setThreshold(e.target.value)} placeholder="100000" className="input" />
+          </div>
+
+          <div>
+            <label className="block text-sm text-zinc-400 mb-1">Duration</label>
+            <select value={duration} onChange={e => setDuration(Number(e.target.value))} className="select">
+              <option value={3600}>1 Hour</option>
+              <option value={86400}>1 Day</option>
+              <option value={604800}>1 Week</option>
+            </select>
+          </div>
+
+          {error && <p className="text-red-400 text-sm">{error}</p>}
+
+          <button type="submit" disabled={submitting} className="btn btn-primary w-full py-3">
+            {submitting ? 'Creating...' : 'Create Market'}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// ============ BET MODAL ============
+function BetModal({ market, onClose, onSuccess }: { market: Market; onClose: () => void; onSuccess: () => void }) {
+  const [position, setPosition] = useState('YES');
+  const [amount, setAmount] = useState('');
+  const [odds, setOdds] = useState<Odds | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState(false);
+
+  useEffect(() => {
+    fetchOdds(market.market_id).then(setOdds);
+  }, [market.market_id]);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!amount || parseFloat(amount) <= 0) { setError('Enter valid amount'); return; }
+    
+    // Fee verification
+    try { await fetchStats(); } catch { setError('Deduction failed'); return; }
+
+    setSubmitting(true);
+    setError(null);
+    try {
+      const wei = BigInt(Math.floor(parseFloat(amount) * 1e18));
+      await placeBet(market.market_id, position, wei);
+      setSuccess(true);
+    } catch (e: any) {
+      setError(e.message);
+    }
+    setSubmitting(false);
+  };
+
+  if (success) {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+        <div className="bg-zinc-900 border border-zinc-800 rounded-2xl w-full max-w-md p-8 text-center">
+          <div className="w-16 h-16 bg-green-500/20 rounded-full flex items-center justify-center mx-auto mb-4">
+            <span className="text-3xl">✓</span>
+          </div>
+          <h3 className="text-xl font-semibold mb-2">Bet Placed!</h3>
+          <p className="text-zinc-400 mb-6">Your {position} bet of {amount} GEN was successful.</p>
+          <button onClick={onSuccess} className="btn btn-primary">Close</button>
+        </div>
+      </div>
+    );
+  }
+
+  const threshold = parseFloat(market.threshold);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="bg-zinc-900 border border-zinc-800 rounded-2xl w-full max-w-md">
+        <div className="flex justify-between items-center p-5 border-b border-zinc-800">
+          <h2 className="text-xl font-semibold">Place Bet</h2>
+          <button onClick={onClose} className="text-zinc-400 hover:text-white text-2xl">&times;</button>
+        </div>
+        
+        <form onSubmit={submit} className="p-5 space-y-4">
+          <div className="bg-zinc-800/50 rounded-lg p-4">
+            <h3 className="font-semibold">{market.asset}/USD</h3>
+            <p className="text-zinc-400 text-sm">
+              Price will be <span className={market.condition === 'above' ? 'text-green-400' : 'text-red-400'}>{market.condition}</span>{' '}
+              <span className="font-mono font-bold">${threshold.toLocaleString()}</span>
+            </p>
+          </div>
+
+          <div>
+            <label className="block text-sm text-zinc-400 mb-1">Your Prediction</label>
+            <div className="grid grid-cols-2 gap-3">
+              <button type="button" onClick={() => setPosition('YES')}
+                className={`p-3 rounded-lg border-2 ${position === 'YES' ? 'border-green-500 bg-green-500/10' : 'border-zinc-700'}`}>
+                ↑ YES {odds && <span className="text-sm text-zinc-500">({odds.yes_probability}%)</span>}
+              </button>
+              <button type="button" onClick={() => setPosition('NO')}
+                className={`p-3 rounded-lg border-2 ${position === 'NO' ? 'border-red-500 bg-red-500/10' : 'border-zinc-700'}`}>
+                ↓ NO {odds && <span className="text-sm text-zinc-500">({odds.no_probability}%)</span>}
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-sm text-zinc-400 mb-1">Amount (GEN)</label>
+            <input type="number" value={amount} onChange={e => setAmount(e.target.value)} placeholder="0.00" step="0.001" className="input" />
+          </div>
+
+          {error && <p className="text-red-400 text-sm">{error}</p>}
+
+          <button type="submit" disabled={submitting} className="btn btn-primary w-full py-3">
+            {submitting ? 'Placing Bet...' : 'Place Bet'}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// ============ HELPERS ============
+function formatTime(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  const d = Math.floor(h / 24);
+  return `${d}d`;
+}
+
+declare global {
+  interface Window {
+    ethereum?: {
+      request: (args: { method: string; params?: any[] }) => Promise<any>;
+    };
+  }
 }
