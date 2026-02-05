@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { createClient } from 'genlayer-js';
 import { studionet } from 'genlayer-js/chains';
 
@@ -40,6 +40,25 @@ interface Toast {
   message: string;
 }
 
+// ============ FIX #1: RECURSIVE JSON UNWRAP ============
+// GenLayer contract methods return json.dumps(...) which is a JSON string.
+// The RPC layer wraps that in another JSON string in data.result.
+// A single JSON.parse only peels one layer, leaving the inner string intact.
+// This helper keeps parsing until the value is no longer a JSON string.
+function deepParse(val: any): any {
+  if (typeof val !== 'string') return val;
+  let current: any = val;
+  for (let i = 0; i < 5; i++) {
+    if (typeof current !== 'string') break;
+    try {
+      current = JSON.parse(current);
+    } catch {
+      break;
+    }
+  }
+  return current;
+}
+
 // ============ DIRECT JSON-RPC CALLS ============
 async function callContract(method: string, args: any[] = []): Promise<any> {
   try {
@@ -57,32 +76,25 @@ async function callContract(method: string, args: any[] = []): Promise<any> {
         id: Date.now(),
       }),
     });
-    
+
     const data = await response.json();
-    console.log(`${method} response:`, data);
-    
+    console.log(`[rpc] ${method} raw:`, JSON.stringify(data).slice(0, 300));
+
     if (data.error) {
       throw new Error(data.error.message || 'RPC Error');
     }
-    
-    // Parse the result
-    let result = data.result;
-    if (typeof result === 'string') {
-      try {
-        result = JSON.parse(result);
-      } catch {
-        // Not JSON, return as-is
-      }
-    }
-    
+
+    // FIX: recursively unwrap nested JSON strings from GenLayer
+    const result = deepParse(data.result);
+    console.log(`[rpc] ${method} parsed:`, result);
     return result;
   } catch (e) {
-    console.error(`${method} error:`, e);
+    console.error(`[rpc] ${method} error:`, e);
     throw e;
   }
 }
 
-// ============ GENLAYER CLIENT FOR WRITE ============
+// ============ GENLAYER CLIENT FOR WRITE OPS ============
 let client: ReturnType<typeof createClient> | null = null;
 let currentWallet: string | null = null;
 
@@ -90,44 +102,44 @@ async function connectWallet(): Promise<string> {
   if (typeof window === 'undefined' || !window.ethereum) {
     throw new Error('Please install MetaMask to continue');
   }
-  
-  const accounts = await window.ethereum.request({ 
-    method: 'eth_requestAccounts' 
+
+  const accounts = await window.ethereum.request({
+    method: 'eth_requestAccounts',
   }) as string[];
-  
+
   if (!accounts?.length) throw new Error('No accounts found');
-  
+
   currentWallet = accounts[0];
-  client = createClient({ 
-    chain: studionet, 
-    account: currentWallet 
+  client = createClient({
+    chain: studionet,
+    account: currentWallet,
   });
-  
+
   return currentWallet;
 }
 
+// ============ FIX #3: REAL 0-GEN DEDUCTION VIA METAMASK ============
+// Sends a 0-value transaction to self through MetaMask.
+// User must click "Confirm" in MetaMask. If rejected → returns false.
 async function verifyDeduction(): Promise<boolean> {
   if (typeof window === 'undefined' || !window.ethereum || !currentWallet) {
     return false;
   }
-  
+
   try {
-    const accounts = await window.ethereum.request({ 
-      method: 'eth_accounts' 
-    }) as string[];
-    
-    if (!accounts?.length || accounts[0].toLowerCase() !== currentWallet.toLowerCase()) {
-      return false;
-    }
-    
-    await window.ethereum.request({
-      method: 'eth_getBalance',
-      params: [accounts[0], 'latest']
+    const txHash = await window.ethereum.request({
+      method: 'eth_sendTransaction',
+      params: [{
+        from: currentWallet,
+        to: currentWallet,
+        value: '0x0',
+        gas: '0x5208',
+      }],
     });
-    
+    console.log('[deduction] confirmed, tx:', txHash);
     return true;
-  } catch (e) {
-    console.error('Deduction verification failed:', e);
+  } catch (e: any) {
+    console.error('[deduction] rejected or failed:', e);
     return false;
   }
 }
@@ -136,31 +148,49 @@ async function verifyDeduction(): Promise<boolean> {
 async function fetchStats(): Promise<Stats> {
   try {
     const result = await callContract('get_stats');
+    if (!result || typeof result !== 'object') {
+      return { total_markets: 0, active_markets: 0, resolved_markets: 0, total_volume: 0 };
+    }
     return {
-      total_markets: Number(result?.total_markets) || 0,
-      active_markets: Number(result?.active_markets) || 0,
-      resolved_markets: Number(result?.resolved_markets) || 0,
-      total_volume: Number(result?.total_volume) || 0,
+      total_markets: Number(result.total_markets) || 0,
+      active_markets: Number(result.active_markets) || 0,
+      resolved_markets: Number(result.resolved_markets) || 0,
+      total_volume: Number(result.total_volume) || 0,
     };
   } catch (e) {
-    console.error('fetchStats error:', e);
+    console.error('[fetch] stats error:', e);
     return { total_markets: 0, active_markets: 0, resolved_markets: 0, total_volume: 0 };
   }
 }
 
 async function fetchMarkets(): Promise<Market[]> {
   try {
-    const ids = await callContract('get_all_market_ids');
-    
-    if (!Array.isArray(ids) || ids.length === 0) return [];
-    
+    let ids = await callContract('get_all_market_ids');
+    console.log('[fetch] ids raw type:', typeof ids, 'value:', ids);
+
+    // Normalize: ensure we have a string[] array
+    if (typeof ids === 'string') {
+      ids = deepParse(ids);
+    }
+    if (!Array.isArray(ids)) {
+      // Could be a single value
+      if (ids !== null && ids !== undefined) {
+        ids = [String(ids)];
+      } else {
+        return [];
+      }
+    }
+    if (ids.length === 0) return [];
+
     const markets: Market[] = [];
     for (const id of ids) {
       try {
-        const m = await callContract('get_market', [String(id)]);
-        if (m?.market_id) {
+        let m = await callContract('get_market', [String(id)]);
+        if (typeof m === 'string') m = deepParse(m);
+
+        if (m && typeof m === 'object' && (m.market_id || m.asset)) {
           markets.push({
-            market_id: String(m.market_id),
+            market_id: String(m.market_id || id),
             asset: String(m.asset || ''),
             condition: String(m.condition || ''),
             threshold: String(m.threshold || '0'),
@@ -172,12 +202,12 @@ async function fetchMarkets(): Promise<Market[]> {
           });
         }
       } catch (e) {
-        console.error(`fetchMarket ${id} error:`, e);
+        console.error(`[fetch] market ${id} error:`, e);
       }
     }
     return markets.sort((a, b) => parseInt(b.market_id) - parseInt(a.market_id));
   } catch (e) {
-    console.error('fetchMarkets error:', e);
+    console.error('[fetch] markets error:', e);
     return [];
   }
 }
@@ -191,47 +221,48 @@ async function fetchOdds(id: string): Promise<Odds> {
       total_pool: Number(result?.total_pool) || 0,
     };
   } catch (e) {
-    console.error('fetchOdds error:', e);
+    console.error('[fetch] odds error:', e);
     return { yes_probability: 50, no_probability: 50, total_pool: 0 };
   }
 }
 
+// ============ WRITE OPERATIONS ============
 async function createMarket(asset: string, condition: string, threshold: number, timestamp: number) {
   if (!client) throw new Error('Wallet not connected');
-  
+
   const tx = await client.writeContract({
     address: CONTRACT as `0x${string}`,
     functionName: 'create_market',
     args: [asset, condition, String(threshold), String(timestamp)],
     value: BigInt(0),
   });
-  
-  console.log('TX Hash:', tx);
-  
-  const receipt = await client.waitForTransactionReceipt({ 
-    hash: tx, 
-    status: 'FINALIZED' 
+
+  console.log('[tx] create_market hash:', tx);
+
+  const receipt = await client.waitForTransactionReceipt({
+    hash: tx,
+    status: 'FINALIZED',
   });
-  
-  console.log('Receipt:', receipt);
+
+  console.log('[tx] create_market receipt:', receipt);
   return receipt;
 }
 
 async function placeBet(id: string, position: string, amount: bigint) {
   if (!client) throw new Error('Wallet not connected');
-  
+
   const tx = await client.writeContract({
     address: CONTRACT as `0x${string}`,
     functionName: 'place_bet',
     args: [id, position],
     value: amount,
   });
-  
-  const receipt = await client.waitForTransactionReceipt({ 
-    hash: tx, 
-    status: 'FINALIZED' 
+
+  const receipt = await client.waitForTransactionReceipt({
+    hash: tx,
+    status: 'FINALIZED',
   });
-  
+
   return receipt;
 }
 
@@ -240,7 +271,7 @@ function ToastContainer({ toasts, removeToast }: { toasts: Toast[]; removeToast:
   return (
     <div className="fixed bottom-6 right-6 z-[100] flex flex-col gap-3">
       {toasts.map(toast => (
-        <div 
+        <div
           key={toast.id}
           className={`flex items-center gap-3 px-5 py-4 rounded-xl shadow-2xl backdrop-blur-md animate-slide-in ${
             toast.type === 'success' ? 'bg-emerald-500/90 text-white' :
@@ -284,10 +315,12 @@ export default function Page() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
-  
+
   const [showCreate, setShowCreate] = useState(false);
   const [showBet, setShowBet] = useState(false);
   const [selectedMarket, setSelectedMarket] = useState<Market | null>(null);
+
+  const knownMarketCount = useRef(0);
 
   const addToast = useCallback((type: Toast['type'], message: string) => {
     const id = Date.now();
@@ -308,13 +341,38 @@ export default function Page() {
       const [s, m] = await Promise.all([fetchStats(), fetchMarkets()]);
       setStats(s);
       setMarkets(m);
+      knownMarketCount.current = s.total_markets;
     } catch (e: any) {
-      console.error('Load error:', e);
+      console.error('[load] error:', e);
     }
     setLoading(false);
   }, []);
 
   useEffect(() => { load(); }, [load]);
+
+  // ============ FIX #2: POLLING UNTIL NEW MARKET APPEARS ============
+  const pollUntilNewMarket = useCallback(async (previousCount: number) => {
+    const maxAttempts = 12;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      await new Promise(r => setTimeout(r, 2500));
+      try {
+        const s = await fetchStats();
+        console.log(`[poll] attempt ${attempt}: total_markets=${s.total_markets}, expecting>${previousCount}`);
+        if (s.total_markets > previousCount) {
+          const m = await fetchMarkets();
+          setStats(s);
+          setMarkets(m);
+          knownMarketCount.current = s.total_markets;
+          return true;
+        }
+      } catch (e) {
+        console.error(`[poll] attempt ${attempt} error:`, e);
+      }
+    }
+    // Final fallback: just load whatever is there
+    await load();
+    return false;
+  }, [load]);
 
   const connect = async () => {
     setConnecting(true);
@@ -322,7 +380,7 @@ export default function Page() {
     try {
       const addr = await connectWallet();
       setAddress(addr);
-      addToast('success', 'Wallet connected successfully');
+      addToast('success', 'Wallet connected');
     } catch (e: any) {
       setError(e.message);
       addToast('error', e.message);
@@ -339,64 +397,59 @@ export default function Page() {
 
   const handleMarketClick = async (m: Market) => {
     setError(null);
-    if (!address) { 
-      setError('Please connect your wallet first');
+    if (!address) {
       addToast('error', 'Please connect your wallet first');
-      return; 
+      return;
     }
-    
-    const verified = await verifyDeduction();
-    if (!verified) {
-      setError('Deduction failed');
+
+    const ok = await verifyDeduction();
+    if (!ok) {
       addToast('error', 'Deduction failed');
       return;
     }
-    
+
     setSelectedMarket(m);
     setShowBet(true);
   };
 
   const handleCreateClick = async () => {
     setError(null);
-    if (!address) { 
-      setError('Please connect your wallet first');
+    if (!address) {
       addToast('error', 'Please connect your wallet first');
-      return; 
+      return;
     }
-    
-    const verified = await verifyDeduction();
-    if (!verified) {
-      setError('Deduction failed');
+
+    const ok = await verifyDeduction();
+    if (!ok) {
       addToast('error', 'Deduction failed');
       return;
     }
-    
+
     setShowCreate(true);
   };
 
   const handleCreateSuccess = useCallback(async () => {
     setShowCreate(false);
-    addToast('success', 'Market created successfully!');
-    
-    // Wait a moment for the blockchain to update
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    await load();
-  }, [addToast, load]);
+    addToast('success', 'Market created! Syncing data...');
+    const prev = knownMarketCount.current;
+    const found = await pollUntilNewMarket(prev);
+    if (found) {
+      addToast('info', 'Market is now live');
+    }
+  }, [addToast, pollUntilNewMarket]);
 
   const handleBetSuccess = useCallback(async () => {
     setShowBet(false);
     setSelectedMarket(null);
-    addToast('success', 'Bet placed successfully!');
-    
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    addToast('success', 'Bet placed!');
+    await new Promise(r => setTimeout(r, 3000));
     await load();
   }, [addToast, load]);
 
   return (
     <div className="min-h-screen bg-[#0a0a0f]">
-      {/* Toast Notifications */}
       <ToastContainer toasts={toasts} removeToast={removeToast} />
-      
+
       {/* Header */}
       <header className="fixed top-0 left-0 right-0 z-50 bg-[#0a0a0f]/90 backdrop-blur-md border-b border-white/5">
         <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
@@ -404,7 +457,7 @@ export default function Page() {
             <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white font-bold shadow-lg shadow-indigo-500/20">G</div>
             <span className="font-semibold text-lg tracking-tight">Gen<span className="text-indigo-400">Predict</span></span>
           </div>
-          
+
           {address ? (
             <div className="flex items-center gap-4">
               <div className="flex items-center gap-2 px-4 py-2 bg-white/5 rounded-full border border-white/10">
@@ -416,8 +469,8 @@ export default function Page() {
               </button>
             </div>
           ) : (
-            <button 
-              onClick={connect} 
+            <button
+              onClick={connect}
               disabled={connecting}
               className="px-5 py-2.5 bg-gradient-to-r from-indigo-500 to-purple-500 hover:from-indigo-600 hover:to-purple-600 rounded-full font-medium text-sm shadow-lg shadow-indigo-500/25 transition-all hover:shadow-indigo-500/40 disabled:opacity-50"
             >
@@ -439,10 +492,10 @@ export default function Page() {
             <p className="text-zinc-400 text-lg mb-10 max-w-2xl mx-auto leading-relaxed">
               Create markets, place bets, and earn rewards with AI-powered price resolution
             </p>
-            
+
             <div className="flex flex-wrap justify-center gap-4 mb-6">
-              <button 
-                onClick={handleCreateClick} 
+              <button
+                onClick={handleCreateClick}
                 className="group px-8 py-4 bg-gradient-to-r from-indigo-500 to-purple-500 hover:from-indigo-600 hover:to-purple-600 rounded-2xl font-semibold shadow-xl shadow-indigo-500/20 transition-all hover:shadow-indigo-500/30 hover:scale-[1.02] active:scale-[0.98]"
               >
                 <span className="flex items-center gap-2">
@@ -452,8 +505,8 @@ export default function Page() {
                   Create Market
                 </span>
               </button>
-              <button 
-                onClick={load} 
+              <button
+                onClick={load}
                 disabled={loading}
                 className="px-8 py-4 bg-white/5 hover:bg-white/10 border border-white/10 hover:border-white/20 rounded-2xl font-semibold transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50"
               >
@@ -465,7 +518,7 @@ export default function Page() {
                 </span>
               </button>
             </div>
-            
+
             {error && (
               <div className="inline-flex items-center gap-2 px-4 py-2 bg-red-500/10 border border-red-500/20 rounded-lg text-red-400">
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -494,12 +547,12 @@ export default function Page() {
             ))}
           </div>
 
-          {/* Markets Section */}
+          {/* Markets */}
           <div className="mb-8">
             <h2 className="text-2xl font-bold mb-2">Prediction Markets</h2>
             <p className="text-zinc-500">Click on a market to place your bet</p>
           </div>
-          
+
           {loading ? (
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
               {[1,2,3].map(i => (
@@ -521,7 +574,7 @@ export default function Page() {
               <div className="text-5xl mb-4">🎯</div>
               <p className="text-xl font-medium mb-2">No markets yet</p>
               <p className="text-zinc-500 mb-6">Be the first to create a prediction market!</p>
-              <button 
+              <button
                 onClick={handleCreateClick}
                 className="px-6 py-3 bg-gradient-to-r from-indigo-500 to-purple-500 rounded-xl font-medium"
               >
@@ -540,17 +593,17 @@ export default function Page() {
 
       {/* Modals */}
       {showCreate && (
-        <CreateModal 
-          onClose={() => setShowCreate(false)} 
+        <CreateModal
+          onClose={() => setShowCreate(false)}
           onSuccess={handleCreateSuccess}
           addToast={addToast}
         />
       )}
-      
+
       {showBet && selectedMarket && (
-        <BetModal 
-          market={selectedMarket} 
-          onClose={() => { setShowBet(false); setSelectedMarket(null); }} 
+        <BetModal
+          market={selectedMarket}
+          onClose={() => { setShowBet(false); setSelectedMarket(null); }}
           onSuccess={handleBetSuccess}
           addToast={addToast}
         />
@@ -564,17 +617,21 @@ function MarketCard({ market, onClick }: { market: Market; onClick: () => void }
   const threshold = parseFloat(market.threshold);
   const timeLeft = parseInt(market.resolution_timestamp) * 1000 - Date.now();
   const isExpired = timeLeft <= 0;
-  
+
   const assetConfig: Record<string, { icon: string; color: string }> = {
     BTC: { icon: '₿', color: 'from-orange-500 to-yellow-500' },
     ETH: { icon: 'Ξ', color: 'from-blue-500 to-indigo-500' },
     SOL: { icon: '◎', color: 'from-purple-500 to-pink-500' },
+    BNB: { icon: 'B', color: 'from-yellow-500 to-amber-500' },
+    XRP: { icon: 'X', color: 'from-gray-400 to-slate-500' },
+    ADA: { icon: 'A', color: 'from-sky-500 to-blue-600' },
+    DOGE: { icon: 'D', color: 'from-amber-400 to-yellow-500' },
   };
-  
-  const config = assetConfig[market.asset] || { icon: market.asset[0], color: 'from-zinc-500 to-zinc-600' };
+
+  const config = assetConfig[market.asset] || { icon: market.asset?.[0] || '?', color: 'from-zinc-500 to-zinc-600' };
 
   return (
-    <div 
+    <div
       onClick={onClick}
       className={`group p-6 bg-white/[0.02] border border-white/5 rounded-2xl cursor-pointer hover:bg-white/[0.04] hover:border-white/10 transition-all hover:scale-[1.01] ${market.resolved ? 'opacity-60' : ''}`}
     >
@@ -604,7 +661,7 @@ function MarketCard({ market, onClick }: { market: Market; onClick: () => void }
           </span>
         )}
       </div>
-      
+
       <p className="text-zinc-300 mb-4">
         Price will be{' '}
         <span className={`font-medium ${market.condition === 'above' ? 'text-emerald-400' : 'text-red-400'}`}>
@@ -612,7 +669,7 @@ function MarketCard({ market, onClick }: { market: Market; onClick: () => void }
         </span>{' '}
         <span className="font-mono font-bold">${threshold.toLocaleString()}</span>
       </p>
-      
+
       <div className="flex justify-between text-sm">
         <div className="flex items-center gap-2">
           <span className="w-2 h-2 bg-emerald-400 rounded-full"></span>
@@ -628,8 +685,8 @@ function MarketCard({ market, onClick }: { market: Market; onClick: () => void }
 }
 
 // ============ CREATE MODAL ============
-function CreateModal({ onClose, onSuccess, addToast }: { 
-  onClose: () => void; 
+function CreateModal({ onClose, onSuccess, addToast }: {
+  onClose: () => void;
   onSuccess: () => void;
   addToast: (type: Toast['type'], message: string) => void;
 }) {
@@ -645,23 +702,23 @@ function CreateModal({ onClose, onSuccess, addToast }: {
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
-    
+
     const priceValue = parseFloat(threshold);
     if (!threshold || isNaN(priceValue) || priceValue <= 0) {
       setError('Please enter a valid price');
       return;
     }
-    
+
     setSubmitting(true);
     setStep('pending');
-    
+
     try {
       const ts = Math.floor(Date.now() / 1000) + duration;
       const receipt = await createMarket(asset, condition, priceValue, ts);
       setTxHash(receipt?.hash || null);
       setStep('success');
     } catch (e: any) {
-      console.error('Create market error:', e);
+      console.error('[create] error:', e);
       setError(e.message || 'Failed to create market');
       setStep('form');
       addToast('error', 'Failed to create market');
@@ -675,7 +732,6 @@ function CreateModal({ onClose, onSuccess, addToast }: {
     { value: 'SOL', label: 'Solana', icon: '◎' },
   ];
 
-  // Success view
   if (step === 'success') {
     return (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
@@ -701,8 +757,8 @@ function CreateModal({ onClose, onSuccess, addToast }: {
               </>
             )}
           </div>
-          <button 
-            onClick={onSuccess} 
+          <button
+            onClick={onSuccess}
             className="w-full py-4 bg-gradient-to-r from-indigo-500 to-purple-500 rounded-xl font-semibold"
           >
             View Markets
@@ -712,7 +768,6 @@ function CreateModal({ onClose, onSuccess, addToast }: {
     );
   }
 
-  // Pending view
   if (step === 'pending') {
     return (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
@@ -731,7 +786,6 @@ function CreateModal({ onClose, onSuccess, addToast }: {
     );
   }
 
-  // Form view
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4" onClick={e => e.target === e.currentTarget && onClose()}>
       <div className="bg-[#12121a] border border-white/10 rounded-3xl w-full max-w-md shadow-2xl animate-scale-in">
@@ -743,7 +797,7 @@ function CreateModal({ onClose, onSuccess, addToast }: {
             </svg>
           </button>
         </div>
-        
+
         <form onSubmit={submit} className="p-6 space-y-5">
           <div>
             <label className="block text-sm text-zinc-400 mb-2">Asset</label>
@@ -754,8 +808,8 @@ function CreateModal({ onClose, onSuccess, addToast }: {
                   type="button"
                   onClick={() => setAsset(opt.value)}
                   className={`p-3 rounded-xl border-2 transition-all ${
-                    asset === opt.value 
-                      ? 'border-indigo-500 bg-indigo-500/10' 
+                    asset === opt.value
+                      ? 'border-indigo-500 bg-indigo-500/10'
                       : 'border-white/10 hover:border-white/20'
                   }`}
                 >
@@ -769,12 +823,12 @@ function CreateModal({ onClose, onSuccess, addToast }: {
           <div>
             <label className="block text-sm text-zinc-400 mb-2">Condition</label>
             <div className="grid grid-cols-2 gap-3">
-              <button 
-                type="button" 
+              <button
+                type="button"
                 onClick={() => setCondition('above')}
                 className={`p-4 rounded-xl border-2 transition-all flex items-center justify-center gap-2 ${
-                  condition === 'above' 
-                    ? 'border-emerald-500 bg-emerald-500/10' 
+                  condition === 'above'
+                    ? 'border-emerald-500 bg-emerald-500/10'
                     : 'border-white/10 hover:border-white/20'
                 }`}
               >
@@ -783,12 +837,12 @@ function CreateModal({ onClose, onSuccess, addToast }: {
                 </svg>
                 <span>Above</span>
               </button>
-              <button 
-                type="button" 
+              <button
+                type="button"
                 onClick={() => setCondition('below')}
                 className={`p-4 rounded-xl border-2 transition-all flex items-center justify-center gap-2 ${
-                  condition === 'below' 
-                    ? 'border-red-500 bg-red-500/10' 
+                  condition === 'below'
+                    ? 'border-red-500 bg-red-500/10'
                     : 'border-white/10 hover:border-white/20'
                 }`}
               >
@@ -804,10 +858,10 @@ function CreateModal({ onClose, onSuccess, addToast }: {
             <label className="block text-sm text-zinc-400 mb-2">Target Price (USD)</label>
             <div className="relative">
               <span className="absolute left-4 top-1/2 -translate-y-1/2 text-zinc-500">$</span>
-              <input 
-                type="number" 
-                value={threshold} 
-                onChange={e => setThreshold(e.target.value)} 
+              <input
+                type="number"
+                value={threshold}
+                onChange={e => setThreshold(e.target.value)}
                 className="w-full pl-8 pr-4 py-3 bg-white/5 border border-white/10 rounded-xl focus:outline-none focus:border-indigo-500 transition-colors"
                 placeholder="50000"
                 min="0"
@@ -821,9 +875,9 @@ function CreateModal({ onClose, onSuccess, addToast }: {
 
           <div>
             <label className="block text-sm text-zinc-400 mb-2">Resolution Time</label>
-            <select 
-              value={duration} 
-              onChange={e => setDuration(Number(e.target.value))} 
+            <select
+              value={duration}
+              onChange={e => setDuration(Number(e.target.value))}
               className="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-xl focus:outline-none focus:border-indigo-500 transition-colors appearance-none cursor-pointer"
             >
               <option value={3600}>1 Hour</option>
@@ -841,9 +895,9 @@ function CreateModal({ onClose, onSuccess, addToast }: {
             </div>
           )}
 
-          <button 
-            type="submit" 
-            disabled={submitting} 
+          <button
+            type="submit"
+            disabled={submitting}
             className="w-full py-4 bg-gradient-to-r from-indigo-500 to-purple-500 hover:from-indigo-600 hover:to-purple-600 rounded-xl font-semibold shadow-lg shadow-indigo-500/25 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
           >
             Create Market
@@ -855,9 +909,9 @@ function CreateModal({ onClose, onSuccess, addToast }: {
 }
 
 // ============ BET MODAL ============
-function BetModal({ market, onClose, onSuccess, addToast }: { 
-  market: Market; 
-  onClose: () => void; 
+function BetModal({ market, onClose, onSuccess, addToast }: {
+  market: Market;
+  onClose: () => void;
   onSuccess: () => void;
   addToast: (type: Toast['type'], message: string) => void;
 }) {
@@ -874,21 +928,21 @@ function BetModal({ market, onClose, onSuccess, addToast }: {
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!amount || parseFloat(amount) <= 0) { 
-      setError('Please enter a valid amount'); 
-      return; 
+    if (!amount || parseFloat(amount) <= 0) {
+      setError('Please enter a valid amount');
+      return;
     }
 
     setSubmitting(true);
     setError(null);
     setStep('pending');
-    
+
     try {
       const wei = BigInt(Math.floor(parseFloat(amount) * 1e18));
       await placeBet(market.market_id, position, wei);
       setStep('success');
     } catch (e: any) {
-      console.error('Place bet error:', e);
+      console.error('[bet] error:', e);
       setError(e.message || 'Failed to place bet');
       setStep('form');
       addToast('error', 'Failed to place bet');
@@ -898,7 +952,6 @@ function BetModal({ market, onClose, onSuccess, addToast }: {
 
   const threshold = parseFloat(market.threshold);
 
-  // Success view
   if (step === 'success') {
     return (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
@@ -920,8 +973,8 @@ function BetModal({ market, onClose, onSuccess, addToast }: {
               <span className="font-semibold">{amount} GEN</span>
             </div>
           </div>
-          <button 
-            onClick={onSuccess} 
+          <button
+            onClick={onSuccess}
             className="w-full py-4 bg-gradient-to-r from-indigo-500 to-purple-500 rounded-xl font-semibold"
           >
             Done
@@ -931,7 +984,6 @@ function BetModal({ market, onClose, onSuccess, addToast }: {
     );
   }
 
-  // Pending view
   if (step === 'pending') {
     return (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
@@ -950,7 +1002,6 @@ function BetModal({ market, onClose, onSuccess, addToast }: {
     );
   }
 
-  // Form view
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4" onClick={e => e.target === e.currentTarget && onClose()}>
       <div className="bg-[#12121a] border border-white/10 rounded-3xl w-full max-w-md shadow-2xl animate-scale-in">
@@ -962,7 +1013,7 @@ function BetModal({ market, onClose, onSuccess, addToast }: {
             </svg>
           </button>
         </div>
-        
+
         <form onSubmit={submit} className="p-6 space-y-5">
           <div className="p-4 bg-white/5 rounded-xl border border-white/5">
             <div className="flex items-center gap-3 mb-2">
@@ -983,12 +1034,12 @@ function BetModal({ market, onClose, onSuccess, addToast }: {
           <div>
             <label className="block text-sm text-zinc-400 mb-2">Your Prediction</label>
             <div className="grid grid-cols-2 gap-3">
-              <button 
-                type="button" 
+              <button
+                type="button"
                 onClick={() => setPosition('YES')}
                 className={`p-4 rounded-xl border-2 transition-all ${
-                  position === 'YES' 
-                    ? 'border-emerald-500 bg-emerald-500/10' 
+                  position === 'YES'
+                    ? 'border-emerald-500 bg-emerald-500/10'
                     : 'border-white/10 hover:border-white/20'
                 }`}
               >
@@ -1000,12 +1051,12 @@ function BetModal({ market, onClose, onSuccess, addToast }: {
                 </div>
                 {odds && <span className="block text-xs text-zinc-500 mt-1">{odds.yes_probability}% odds</span>}
               </button>
-              <button 
-                type="button" 
+              <button
+                type="button"
                 onClick={() => setPosition('NO')}
                 className={`p-4 rounded-xl border-2 transition-all ${
-                  position === 'NO' 
-                    ? 'border-red-500 bg-red-500/10' 
+                  position === 'NO'
+                    ? 'border-red-500 bg-red-500/10'
                     : 'border-white/10 hover:border-white/20'
                 }`}
               >
@@ -1022,11 +1073,11 @@ function BetModal({ market, onClose, onSuccess, addToast }: {
 
           <div>
             <label className="block text-sm text-zinc-400 mb-2">Bet Amount (GEN)</label>
-            <input 
-              type="number" 
-              value={amount} 
-              onChange={e => setAmount(e.target.value)} 
-              placeholder="0.00" 
+            <input
+              type="number"
+              value={amount}
+              onChange={e => setAmount(e.target.value)}
+              placeholder="0.00"
               step="0.001"
               className="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-xl focus:outline-none focus:border-indigo-500 transition-colors"
             />
@@ -1041,9 +1092,9 @@ function BetModal({ market, onClose, onSuccess, addToast }: {
             </div>
           )}
 
-          <button 
-            type="submit" 
-            disabled={submitting} 
+          <button
+            type="submit"
+            disabled={submitting}
             className="w-full py-4 bg-gradient-to-r from-indigo-500 to-purple-500 hover:from-indigo-600 hover:to-purple-600 rounded-xl font-semibold shadow-lg shadow-indigo-500/25 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
           >
             Place Bet
