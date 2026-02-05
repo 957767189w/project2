@@ -6,7 +6,7 @@ import { studionet } from 'genlayer-js/chains';
 
 // ============ CONFIG ============
 const CONTRACT = '0x7d15C521f4A463Dc833d550e66635e9BE5063Eb4';
-const RPC_URL = 'https://studio.genlayer.com/api';
+const CONTRACT_ADDR = CONTRACT as `0x${string}`;
 
 // ============ TYPES ============
 interface Market {
@@ -40,62 +40,49 @@ interface Toast {
   message: string;
 }
 
-// ============ FIX #1: RECURSIVE JSON UNWRAP ============
-// GenLayer contract methods return json.dumps(...) which is a JSON string.
-// The RPC layer wraps that in another JSON string in data.result.
-// A single JSON.parse only peels one layer, leaving the inner string intact.
-// This helper keeps parsing until the value is no longer a JSON string.
+// ============ DEEP JSON UNWRAP ============
+// GenLayer contract view methods return json.dumps() strings.
+// The SDK may return them as a raw string. We recursively parse
+// until we reach the actual JS object/array.
 function deepParse(val: any): any {
   if (typeof val !== 'string') return val;
-  let current: any = val;
+  let cur: any = val;
   for (let i = 0; i < 5; i++) {
-    if (typeof current !== 'string') break;
+    if (typeof cur !== 'string') break;
     try {
-      current = JSON.parse(current);
+      cur = JSON.parse(cur);
     } catch {
       break;
     }
   }
-  return current;
+  return cur;
 }
 
-// ============ DIRECT JSON-RPC CALLS ============
-async function callContract(method: string, args: any[] = []): Promise<any> {
+// ============ READ-ONLY CLIENT (no wallet needed) ============
+// genlayer-js SDK readContract handles all RPC encoding internally.
+// This replaces the broken raw fetch() calls that caused
+// "Unexpected parameter: to" error.
+const readClient = createClient({ chain: studionet });
+
+async function callRead(functionName: string, args: any[] = []): Promise<any> {
   try {
-    const response = await fetch(RPC_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        method: 'gen_call',
-        params: {
-          to: CONTRACT,
-          function: method,
-          args: args,
-        },
-        id: Date.now(),
-      }),
+    const raw = await readClient.readContract({
+      address: CONTRACT_ADDR,
+      functionName,
+      args,
     });
-
-    const data = await response.json();
-    console.log(`[rpc] ${method} raw:`, JSON.stringify(data).slice(0, 300));
-
-    if (data.error) {
-      throw new Error(data.error.message || 'RPC Error');
-    }
-
-    // FIX: recursively unwrap nested JSON strings from GenLayer
-    const result = deepParse(data.result);
-    console.log(`[rpc] ${method} parsed:`, result);
-    return result;
+    console.log(`[read] ${functionName} raw:`, raw);
+    const parsed = deepParse(raw);
+    console.log(`[read] ${functionName} parsed:`, parsed);
+    return parsed;
   } catch (e) {
-    console.error(`[rpc] ${method} error:`, e);
+    console.error(`[read] ${functionName} error:`, e);
     throw e;
   }
 }
 
-// ============ GENLAYER CLIENT FOR WRITE OPS ============
-let client: ReturnType<typeof createClient> | null = null;
+// ============ WRITE CLIENT (needs MetaMask wallet) ============
+let writeClient: ReturnType<typeof createClient> | null = null;
 let currentWallet: string | null = null;
 
 async function connectWallet(): Promise<string> {
@@ -110,7 +97,7 @@ async function connectWallet(): Promise<string> {
   if (!accounts?.length) throw new Error('No accounts found');
 
   currentWallet = accounts[0];
-  client = createClient({
+  writeClient = createClient({
     chain: studionet,
     account: currentWallet,
   });
@@ -118,9 +105,9 @@ async function connectWallet(): Promise<string> {
   return currentWallet;
 }
 
-// ============ FIX #3: REAL 0-GEN DEDUCTION VIA METAMASK ============
-// Sends a 0-value transaction to self through MetaMask.
-// User must click "Confirm" in MetaMask. If rejected → returns false.
+// ============ 0-GEN DEDUCTION VIA METAMASK ============
+// Sends a 0-value tx to self. User must click Confirm in MetaMask.
+// If rejected, returns false => shows "Deduction failed".
 async function verifyDeduction(): Promise<boolean> {
   if (typeof window === 'undefined' || !window.ethereum || !currentWallet) {
     return false;
@@ -136,18 +123,18 @@ async function verifyDeduction(): Promise<boolean> {
         gas: '0x5208',
       }],
     });
-    console.log('[deduction] confirmed, tx:', txHash);
+    console.log('[deduction] confirmed:', txHash);
     return true;
   } catch (e: any) {
-    console.error('[deduction] rejected or failed:', e);
+    console.error('[deduction] rejected:', e);
     return false;
   }
 }
 
-// ============ DATA FETCHING ============
+// ============ DATA FETCHING (via SDK readContract) ============
 async function fetchStats(): Promise<Stats> {
   try {
-    const result = await callContract('get_stats');
+    const result = await callRead('get_stats');
     if (!result || typeof result !== 'object') {
       return { total_markets: 0, active_markets: 0, resolved_markets: 0, total_volume: 0 };
     }
@@ -165,27 +152,17 @@ async function fetchStats(): Promise<Stats> {
 
 async function fetchMarkets(): Promise<Market[]> {
   try {
-    let ids = await callContract('get_all_market_ids');
-    console.log('[fetch] ids raw type:', typeof ids, 'value:', ids);
+    let ids = await callRead('get_all_market_ids');
+    console.log('[fetch] ids:', ids, typeof ids);
 
-    // Normalize: ensure we have a string[] array
-    if (typeof ids === 'string') {
-      ids = deepParse(ids);
-    }
-    if (!Array.isArray(ids)) {
-      // Could be a single value
-      if (ids !== null && ids !== undefined) {
-        ids = [String(ids)];
-      } else {
-        return [];
-      }
-    }
-    if (ids.length === 0) return [];
+    // Ensure we have an array
+    if (typeof ids === 'string') ids = deepParse(ids);
+    if (!Array.isArray(ids) || ids.length === 0) return [];
 
     const markets: Market[] = [];
     for (const id of ids) {
       try {
-        let m = await callContract('get_market', [String(id)]);
+        let m = await callRead('get_market', [String(id)]);
         if (typeof m === 'string') m = deepParse(m);
 
         if (m && typeof m === 'object' && (m.market_id || m.asset)) {
@@ -214,7 +191,7 @@ async function fetchMarkets(): Promise<Market[]> {
 
 async function fetchOdds(id: string): Promise<Odds> {
   try {
-    const result = await callContract('get_market_odds', [id]);
+    const result = await callRead('get_market_odds', [id]);
     return {
       yes_probability: Number(result?.yes_probability) || 50,
       no_probability: Number(result?.no_probability) || 50,
@@ -226,12 +203,12 @@ async function fetchOdds(id: string): Promise<Odds> {
   }
 }
 
-// ============ WRITE OPERATIONS ============
+// ============ WRITE OPERATIONS (via SDK writeContract) ============
 async function createMarket(asset: string, condition: string, threshold: number, timestamp: number) {
-  if (!client) throw new Error('Wallet not connected');
+  if (!writeClient) throw new Error('Wallet not connected');
 
-  const tx = await client.writeContract({
-    address: CONTRACT as `0x${string}`,
+  const tx = await writeClient.writeContract({
+    address: CONTRACT_ADDR,
     functionName: 'create_market',
     args: [asset, condition, String(threshold), String(timestamp)],
     value: BigInt(0),
@@ -239,7 +216,7 @@ async function createMarket(asset: string, condition: string, threshold: number,
 
   console.log('[tx] create_market hash:', tx);
 
-  const receipt = await client.waitForTransactionReceipt({
+  const receipt = await writeClient.waitForTransactionReceipt({
     hash: tx,
     status: 'FINALIZED',
   });
@@ -249,16 +226,16 @@ async function createMarket(asset: string, condition: string, threshold: number,
 }
 
 async function placeBet(id: string, position: string, amount: bigint) {
-  if (!client) throw new Error('Wallet not connected');
+  if (!writeClient) throw new Error('Wallet not connected');
 
-  const tx = await client.writeContract({
-    address: CONTRACT as `0x${string}`,
+  const tx = await writeClient.writeContract({
+    address: CONTRACT_ADDR,
     functionName: 'place_bet',
     args: [id, position],
     value: amount,
   });
 
-  const receipt = await client.waitForTransactionReceipt({
+  const receipt = await writeClient.waitForTransactionReceipt({
     hash: tx,
     status: 'FINALIZED',
   });
@@ -320,7 +297,7 @@ export default function Page() {
   const [showBet, setShowBet] = useState(false);
   const [selectedMarket, setSelectedMarket] = useState<Market | null>(null);
 
-  const knownMarketCount = useRef(0);
+  const knownCount = useRef(0);
 
   const addToast = useCallback((type: Toast['type'], message: string) => {
     const id = Date.now();
@@ -341,7 +318,7 @@ export default function Page() {
       const [s, m] = await Promise.all([fetchStats(), fetchMarkets()]);
       setStats(s);
       setMarkets(m);
-      knownMarketCount.current = s.total_markets;
+      knownCount.current = s.total_markets;
     } catch (e: any) {
       console.error('[load] error:', e);
     }
@@ -350,26 +327,24 @@ export default function Page() {
 
   useEffect(() => { load(); }, [load]);
 
-  // ============ FIX #2: POLLING UNTIL NEW MARKET APPEARS ============
-  const pollUntilNewMarket = useCallback(async (previousCount: number) => {
-    const maxAttempts = 12;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  // Poll until new market appears after creation
+  const pollForNew = useCallback(async (prev: number) => {
+    for (let i = 1; i <= 15; i++) {
       await new Promise(r => setTimeout(r, 2500));
       try {
         const s = await fetchStats();
-        console.log(`[poll] attempt ${attempt}: total_markets=${s.total_markets}, expecting>${previousCount}`);
-        if (s.total_markets > previousCount) {
+        console.log(`[poll] attempt ${i}: markets=${s.total_markets}, need>${prev}`);
+        if (s.total_markets > prev) {
           const m = await fetchMarkets();
           setStats(s);
           setMarkets(m);
-          knownMarketCount.current = s.total_markets;
+          knownCount.current = s.total_markets;
           return true;
         }
       } catch (e) {
-        console.error(`[poll] attempt ${attempt} error:`, e);
+        console.error(`[poll] attempt ${i} error:`, e);
       }
     }
-    // Final fallback: just load whatever is there
     await load();
     return false;
   }, [load]);
@@ -389,7 +364,7 @@ export default function Page() {
   };
 
   const disconnect = () => {
-    client = null;
+    writeClient = null;
     currentWallet = null;
     setAddress(null);
     addToast('info', 'Wallet disconnected');
@@ -401,13 +376,11 @@ export default function Page() {
       addToast('error', 'Please connect your wallet first');
       return;
     }
-
     const ok = await verifyDeduction();
     if (!ok) {
       addToast('error', 'Deduction failed');
       return;
     }
-
     setSelectedMarket(m);
     setShowBet(true);
   };
@@ -418,25 +391,23 @@ export default function Page() {
       addToast('error', 'Please connect your wallet first');
       return;
     }
-
     const ok = await verifyDeduction();
     if (!ok) {
       addToast('error', 'Deduction failed');
       return;
     }
-
     setShowCreate(true);
   };
 
   const handleCreateSuccess = useCallback(async () => {
     setShowCreate(false);
-    addToast('success', 'Market created! Syncing data...');
-    const prev = knownMarketCount.current;
-    const found = await pollUntilNewMarket(prev);
+    addToast('success', 'Market created! Syncing...');
+    const prev = knownCount.current;
+    const found = await pollForNew(prev);
     if (found) {
       addToast('info', 'Market is now live');
     }
-  }, [addToast, pollUntilNewMarket]);
+  }, [addToast, pollForNew]);
 
   const handleBetSuccess = useCallback(async () => {
     setShowBet(false);
