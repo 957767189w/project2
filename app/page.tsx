@@ -2,26 +2,11 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { createClient } from 'genlayer-js';
+import { studionet } from 'genlayer-js/chains';
 
-// ============ CONFIGURATION ============
-const CONTRACT_ADDRESS = '0x7d15C521f4A463Dc833d550e66635e9BE5063Eb4';
-const GENLAYER_ENDPOINT = 'https://studio.genlayer.com/api';
-
-// Chain definition (since genlayer-js/chains import fails)
-const GENLAYER_CHAIN = {
-  id: 61999,
-  name: 'GenLayer Studio',
-  nativeCurrency: {
-    name: 'GEN',
-    symbol: 'GEN',
-    decimals: 18,
-  },
-  rpcUrls: {
-    default: {
-      http: [GENLAYER_ENDPOINT],
-    },
-  },
-};
+// ============ CONFIG ============
+// 使用你提供的正确合约地址
+const CONTRACT = '0x7d15C521f4A463Dc833d550e66635e9BE5063Eb4';
 
 // ============ TYPES ============
 interface Market {
@@ -29,415 +14,341 @@ interface Market {
   asset: string;
   condition: string;
   threshold: string;
+  resolution_timestamp: string;
   yes_pool: string;
   no_pool: string;
   resolved: boolean;
   outcome: string;
 }
 
-// ============ GLOBAL STATE ============
-let genlayerClient: ReturnType<typeof createClient> | null = null;
-
-// ============ CLIENT MANAGEMENT ============
-function initClient(account?: string) {
-  const config: any = {
-    chain: GENLAYER_CHAIN,
-    endpoint: GENLAYER_ENDPOINT,
-  };
-  
-  if (account) {
-    config.account = account;
-  }
-  
-  genlayerClient = createClient(config);
-  return genlayerClient;
+interface Stats {
+  total_markets: number;
+  active_markets: number;
+  resolved_markets: number;
+  total_volume: number;
 }
 
-function getClient() {
-  if (!genlayerClient) {
-    genlayerClient = initClient();
-  }
-  return genlayerClient;
+interface Odds {
+  yes_probability: number;
+  no_probability: number;
+  total_pool: number;
 }
 
-// ============ CONTRACT INTERACTION ============
-async function callRead(functionName: string, args: any[] = []): Promise<any> {
-  const client = getClient();
+// ============ GENLAYER CLIENT ============
+let client: any = null;
+let wallet: string | null = null;
+
+async function connectWallet(): Promise<string> {
+  if (typeof window === 'undefined' || !window.ethereum) {
+    throw new Error('MetaMask not installed');
+  }
+  const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' }) as string[];
+  if (!accounts?.length) throw new Error('No accounts');
   
+  wallet = accounts[0];
+  // 使用 studionet 预定义链配置
+  client = createClient({ 
+    chain: studionet, 
+    account: wallet 
+  });
+  
+  try { 
+    await client.initializeConsensusSmartContract(); 
+  } catch(e) {
+    console.log('initializeConsensusSmartContract:', e);
+  }
+  return wallet;
+}
+
+function getReadClient() {
+  // 使用 studionet 预定义链配置进行读取
+  return createClient({ chain: studionet });
+}
+
+async function fetchStats(): Promise<Stats> {
+  const c = getReadClient();
   try {
-    const result = await client.readContract({
-      address: CONTRACT_ADDRESS as `0x${string}`,
-      functionName,
-      args,
+    const r = await c.readContract({ 
+      address: CONTRACT as `0x${string}`, 
+      functionName: 'get_stats', 
+      args: [] 
     });
+    console.log('fetchStats result:', r);
+    return JSON.parse(r as string);
+  } catch (e) {
+    console.error('fetchStats error:', e);
+    return { total_markets: 0, active_markets: 0, resolved_markets: 0, total_volume: 0 };
+  }
+}
+
+async function fetchMarkets(): Promise<Market[]> {
+  const c = getReadClient();
+  try {
+    const idsResult = await c.readContract({ 
+      address: CONTRACT as `0x${string}`, 
+      functionName: 'get_all_market_ids', 
+      args: [] 
+    });
+    console.log('fetchMarkets ids:', idsResult);
+    const ids = JSON.parse(idsResult as string);
     
-    // Parse JSON if string
-    if (typeof result === 'string') {
+    const markets: Market[] = [];
+    for (const id of ids) {
       try {
-        return JSON.parse(result);
-      } catch {
-        return result;
+        const m = JSON.parse(await c.readContract({ 
+          address: CONTRACT as `0x${string}`, 
+          functionName: 'get_market', 
+          args: [id] 
+        }) as string);
+        if (m?.market_id) markets.push(m);
+      } catch (e) {
+        console.error(`fetchMarket ${id} error:`, e);
       }
     }
-    return result;
-  } catch (error) {
-    console.error(`Read ${functionName} error:`, error);
-    throw error;
+    return markets.sort((a, b) => parseInt(b.market_id) - parseInt(a.market_id));
+  } catch (e) {
+    console.error('fetchMarkets error:', e);
+    return [];
   }
 }
 
-async function callWrite(
-  functionName: string, 
-  args: any[], 
-  value: bigint = BigInt(0),
-  account: string
-): Promise<string> {
-  // Reinitialize client with account for writing
-  const client = initClient(account);
-  
-  const txHash = await client.writeContract({
-    address: CONTRACT_ADDRESS as `0x${string}`,
-    functionName,
-    args,
-    value,
-  });
-  
-  // Wait for confirmation
-  await client.waitForTransactionReceipt({
-    hash: txHash,
-    status: 'FINALIZED',
-  });
-  
-  return txHash;
+async function fetchOdds(id: string): Promise<Odds> {
+  const c = getReadClient();
+  try {
+    const r = await c.readContract({ 
+      address: CONTRACT as `0x${string}`, 
+      functionName: 'get_market_odds', 
+      args: [id] 
+    });
+    return JSON.parse(r as string);
+  } catch (e) {
+    console.error('fetchOdds error:', e);
+    return { yes_probability: 50, no_probability: 50, total_pool: 0 };
+  }
 }
 
-// ============ MAIN COMPONENT ============
-export default function Home() {
-  // Wallet
-  const [wallet, setWallet] = useState<string | null>(null);
-  const [connecting, setConnecting] = useState(false);
+async function createMarket(asset: string, condition: string, threshold: number, timestamp: number) {
+  if (!client) throw new Error('Not connected');
   
-  // Data
-  const [stats, setStats] = useState({ total_markets: 0, active_markets: 0, resolved_markets: 0, total_volume: 0 });
+  console.log('Creating market with params:', { asset, condition, threshold, timestamp });
+  
+  const tx = await client.writeContract({
+    address: CONTRACT as `0x${string}`,
+    functionName: 'create_market',
+    args: [asset, condition, threshold.toString(), timestamp.toString()],
+    value: BigInt(0),
+  });
+  
+  console.log('Transaction hash:', tx);
+  
+  const receipt = await client.waitForTransactionReceipt({ 
+    hash: tx, 
+    status: 'FINALIZED' 
+  });
+  
+  console.log('Transaction receipt:', receipt);
+  return receipt;
+}
+
+async function placeBet(id: string, position: string, amount: bigint) {
+  if (!client) throw new Error('Not connected');
+  
+  console.log('Placing bet:', { id, position, amount: amount.toString() });
+  
+  const tx = await client.writeContract({
+    address: CONTRACT as `0x${string}`,
+    functionName: 'place_bet',
+    args: [id, position],
+    value: amount,
+  });
+  
+  console.log('Transaction hash:', tx);
+  
+  const receipt = await client.waitForTransactionReceipt({ 
+    hash: tx, 
+    status: 'FINALIZED' 
+  });
+  
+  console.log('Transaction receipt:', receipt);
+  return receipt;
+}
+
+// ============ MAIN PAGE ============
+export default function Page() {
+  const [address, setAddress] = useState<string | null>(null);
+  const [connecting, setConnecting] = useState(false);
+  const [stats, setStats] = useState<Stats | null>(null);
   const [markets, setMarkets] = useState<Market[]>([]);
   const [loading, setLoading] = useState(true);
-  const [dataError, setDataError] = useState(false);
-  
-  // UI
   const [error, setError] = useState<string | null>(null);
-  const [modal, setModal] = useState<'create' | 'bet' | null>(null);
+  
+  const [showCreate, setShowCreate] = useState(false);
+  const [showBet, setShowBet] = useState(false);
   const [selectedMarket, setSelectedMarket] = useState<Market | null>(null);
 
-  // ============ LOAD DATA ============
-  const loadData = useCallback(async () => {
+  const load = useCallback(async () => {
     setLoading(true);
-    setDataError(false);
-    
+    setError(null);
     try {
-      // Load stats
-      const statsData = await callRead('get_stats');
-      if (statsData) setStats(statsData);
-      
-      // Load market IDs
-      const ids = await callRead('get_all_market_ids');
-      
-      if (Array.isArray(ids) && ids.length > 0) {
-        const marketList: Market[] = [];
-        
-        for (const id of ids) {
-          try {
-            const market = await callRead('get_market', [String(id)]);
-            if (market?.market_id) {
-              marketList.push(market);
-            }
-          } catch (e) {
-            console.warn(`Failed to load market ${id}`);
-          }
-        }
-        
-        setMarkets(marketList.reverse());
-      }
-    } catch (e) {
-      console.error('Load data error:', e);
-      setDataError(true);
+      const [s, m] = await Promise.all([fetchStats(), fetchMarkets()]);
+      setStats(s);
+      setMarkets(m);
+    } catch (e: any) {
+      console.error('Load error:', e);
+      setError(e.message || 'Failed to load data');
     }
-    
     setLoading(false);
   }, []);
 
-  useEffect(() => {
-    loadData();
-  }, [loadData]);
+  useEffect(() => { load(); }, [load]);
 
-  // ============ WALLET CONNECTION ============
-  const connectWallet = async () => {
-    if (!window.ethereum) {
-      setError('MetaMask not installed');
-      return;
-    }
-    
+  const connect = async () => {
     setConnecting(true);
     setError(null);
-    
     try {
-      const accounts = await window.ethereum.request({
-        method: 'eth_requestAccounts',
-      }) as string[];
-      
-      if (accounts?.[0]) {
-        setWallet(accounts[0]);
-        initClient(accounts[0]);
-      }
+      const addr = await connectWallet();
+      setAddress(addr);
     } catch (e: any) {
-      setError(e.message || 'Connection failed');
+      console.error('Connect error:', e);
+      setError(e.message);
     }
-    
     setConnecting(false);
   };
 
-  const disconnectWallet = () => {
-    setWallet(null);
-    genlayerClient = null;
+  const disconnect = () => {
+    client = null;
+    wallet = null;
+    setAddress(null);
   };
 
-  // ============ FEE CHECK (value = 0) ============
-  const checkFee = async (): Promise<boolean> => {
-    if (!wallet) {
-      setError('Connect wallet first');
-      return false;
-    }
-    
-    try {
-      await callRead('get_stats');
-      return true;
-    } catch {
-      setError('Deduction failed');
-      return false;
-    }
-  };
-
-  // ============ CREATE MARKET ============
-  const handleCreateMarket = async (asset: string, condition: string, threshold: number, duration: number) => {
-    if (!wallet) {
-      setError('Connect wallet first');
-      return;
-    }
-    
+  const handleMarketClick = async (m: Market) => {
     setError(null);
-    
-    try {
-      const timestamp = Math.floor(Date.now() / 1000) + duration;
-      
-      await callWrite(
-        'create_market',
-        [asset, condition, String(threshold), String(timestamp)],
-        BigInt(0),
-        wallet
-      );
-      
-      setModal(null);
-      loadData();
-    } catch (e: any) {
-      setError(e.message || 'Failed to create market');
+    if (!address) { 
+      setError('Please connect wallet first'); 
+      return; 
     }
+    setSelectedMarket(m);
+    setShowBet(true);
   };
 
-  // ============ PLACE BET ============
-  const handlePlaceBet = async (marketId: string, position: string, amount: number) => {
-    if (!wallet) {
-      setError('Connect wallet first');
-      return;
-    }
-    
+  const handleCreateClick = async () => {
     setError(null);
-    
-    try {
-      const amountWei = BigInt(Math.floor(amount * 1e18));
-      
-      await callWrite(
-        'place_bet',
-        [marketId, position],
-        amountWei,
-        wallet
-      );
-      
-      setModal(null);
-      setSelectedMarket(null);
-      loadData();
-    } catch (e: any) {
-      setError(e.message || 'Failed to place bet');
+    if (!address) { 
+      setError('Please connect wallet first'); 
+      return; 
     }
+    setShowCreate(true);
   };
 
-  // ============ BUTTON HANDLERS ============
-  const onCreateClick = async () => {
-    const ok = await checkFee();
-    if (ok) setModal('create');
-  };
-
-  const onMarketClick = async (market: Market) => {
-    const ok = await checkFee();
-    if (ok) {
-      setSelectedMarket(market);
-      setModal('bet');
-    }
-  };
-
-  // ============ RENDER ============
   return (
-    <div className="min-h-screen bg-[#08080c]">
+    <div className="min-h-screen">
       {/* Header */}
-      <header className="border-b border-white/5">
-        <div className="max-w-6xl mx-auto h-16 px-6 flex items-center justify-between">
-          <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center">
-              <span className="text-white font-bold text-sm">G</span>
-            </div>
-            <span className="text-white font-semibold text-lg tracking-tight">
-              Gen<span className="text-blue-400">Predict</span>
-            </span>
+      <header className="fixed top-0 left-0 right-0 z-50 bg-zinc-900/80 backdrop-blur border-b border-zinc-800">
+        <div className="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white font-bold text-sm">G</div>
+            <span className="font-bold text-lg">Gen<span className="text-blue-400">Predict</span></span>
           </div>
           
-          {wallet ? (
+          {address ? (
             <div className="flex items-center gap-3">
-              <div className="px-3 py-1.5 bg-white/5 border border-white/10 rounded-lg flex items-center gap-2">
-                <span className="w-2 h-2 bg-emerald-500 rounded-full" />
-                <span className="text-sm font-mono text-zinc-300">
-                  {wallet.slice(0, 6)}...{wallet.slice(-4)}
-                </span>
+              <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 bg-zinc-800 rounded-lg border border-zinc-700">
+                <span className="w-2 h-2 bg-green-500 rounded-full"></span>
+                <span className="font-mono text-sm text-zinc-300">{address.slice(0,6)}...{address.slice(-4)}</span>
               </div>
-              <button
-                onClick={disconnectWallet}
-                className="px-3 py-1.5 text-sm text-zinc-400 hover:text-white border border-white/10 rounded-lg hover:bg-white/5 transition"
-              >
-                Disconnect
-              </button>
+              <button onClick={disconnect} className="btn btn-outline text-sm">Disconnect</button>
             </div>
           ) : (
-            <button
-              onClick={connectWallet}
-              disabled={connecting}
-              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition disabled:opacity-50"
-            >
+            <button onClick={connect} disabled={connecting} className="btn btn-primary">
               {connecting ? 'Connecting...' : 'Connect Wallet'}
             </button>
           )}
         </div>
       </header>
 
-      {/* Main */}
-      <main className="max-w-6xl mx-auto px-6 py-12">
-        {/* Error */}
-        {error && (
-          <div className="mb-8 p-4 bg-red-500/10 border border-red-500/20 rounded-xl text-red-400">
-            {error}
-          </div>
-        )}
-
-        {/* Hero */}
-        <div className="text-center mb-14">
-          <h1 className="text-5xl font-bold mb-4 bg-gradient-to-r from-blue-400 via-indigo-400 to-purple-400 bg-clip-text text-transparent">
-            Predict Crypto Prices
-          </h1>
-          <p className="text-lg text-zinc-500 max-w-lg mx-auto">
-            Create markets, place bets, and earn rewards with AI-powered price resolution
-          </p>
-        </div>
-
-        {/* Stats */}
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-10">
-          {[
-            { label: 'Total Markets', value: stats.total_markets },
-            { label: 'Active', value: stats.active_markets },
-            { label: 'Resolved', value: stats.resolved_markets },
-            { label: 'Volume', value: `${stats.total_volume} GEN` },
-          ].map((item) => (
-            <div key={item.label} className="bg-white/[0.02] border border-white/5 rounded-xl p-5">
-              <p className="text-sm text-zinc-500 mb-1">{item.label}</p>
-              <p className="text-2xl font-bold text-white">{item.value}</p>
+      <main className="pt-24 pb-16 px-4">
+        <div className="max-w-6xl mx-auto">
+          {/* Hero */}
+          <div className="text-center mb-12">
+            <h1 className="text-4xl sm:text-5xl font-extrabold mb-4">
+              <span className="bg-gradient-to-r from-blue-400 via-purple-400 to-pink-400 bg-clip-text text-transparent">
+                Predict Crypto Prices
+              </span>
+            </h1>
+            <p className="text-zinc-400 text-lg mb-8 max-w-xl mx-auto">
+              Create markets, place bets, and earn rewards with AI-powered price resolution
+            </p>
+            
+            <div className="flex flex-wrap justify-center gap-4 mb-4">
+              <button onClick={handleCreateClick} className="btn btn-primary px-6 py-3">
+                + Create Market
+              </button>
+              <button onClick={load} className="btn btn-outline px-6 py-3">
+                Refresh
+              </button>
             </div>
-          ))}
-        </div>
+            
+            {error && (
+              <p className="text-red-400 bg-red-500/10 inline-block px-4 py-2 rounded-lg">{error}</p>
+            )}
+          </div>
 
-        {/* Actions */}
-        <div className="flex items-center gap-3 mb-10">
-          <button
-            onClick={onCreateClick}
-            className="px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-xl transition"
-          >
-            + Create Market
-          </button>
-          <button
-            onClick={loadData}
-            disabled={loading}
-            className="px-6 py-3 border border-white/10 hover:bg-white/5 text-white font-medium rounded-xl transition disabled:opacity-50"
-          >
-            {loading ? 'Loading...' : 'Refresh'}
-          </button>
-        </div>
+          {/* Stats */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-12">
+            {[
+              { label: 'Total Markets', value: stats?.total_markets ?? 0 },
+              { label: 'Active', value: stats?.active_markets ?? 0 },
+              { label: 'Resolved', value: stats?.resolved_markets ?? 0 },
+              { label: 'Volume', value: `${stats?.total_volume ?? 0} GEN` },
+            ].map(s => (
+              <div key={s.label} className="card">
+                <p className="text-sm text-zinc-500">{s.label}</p>
+                <p className="text-2xl font-bold">{s.value}</p>
+              </div>
+            ))}
+          </div>
 
-        {/* Markets */}
-        <section>
-          <h2 className="text-2xl font-bold text-white mb-6">Markets</h2>
+          {/* Markets */}
+          <h2 className="text-2xl font-bold mb-6">Markets</h2>
           
           {loading ? (
-            <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
-              {[1, 2, 3].map((i) => (
-                <div key={i} className="bg-white/[0.02] border border-white/5 rounded-xl p-6 animate-pulse">
-                  <div className="h-6 w-24 bg-white/10 rounded mb-4" />
-                  <div className="h-4 w-full bg-white/10 rounded mb-2" />
-                  <div className="h-4 w-2/3 bg-white/10 rounded" />
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {[1,2,3].map(i => (
+                <div key={i} className="card animate-pulse">
+                  <div className="h-10 w-10 bg-zinc-800 rounded-full mb-4"></div>
+                  <div className="h-4 w-32 bg-zinc-800 rounded mb-2"></div>
+                  <div className="h-4 w-48 bg-zinc-800 rounded"></div>
                 </div>
               ))}
             </div>
-          ) : dataError ? (
-            <div className="text-center py-16">
-              <p className="text-zinc-500 mb-4">Unable to load markets from contract</p>
-              <button onClick={loadData} className="text-blue-400 hover:text-blue-300">
-                Try Again
-              </button>
-            </div>
           ) : markets.length === 0 ? (
-            <div className="text-center py-16">
-              <div className="w-16 h-16 bg-white/5 rounded-full flex items-center justify-center mx-auto mb-4">
-                <span className="text-3xl">📊</span>
-              </div>
-              <h3 className="text-xl font-semibold text-white mb-2">No Markets Yet</h3>
-              <p className="text-zinc-500 mb-6">Create the first prediction market</p>
-              <button
-                onClick={onCreateClick}
-                className="px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-xl transition"
-              >
-                Create Market
-              </button>
+            <div className="text-center py-16 text-zinc-500">
+              <p className="text-lg mb-2">No markets yet</p>
+              <p className="text-sm">Be the first to create a prediction market!</p>
             </div>
           ) : (
-            <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
-              {markets.map((market) => (
-                <MarketCard key={market.market_id} market={market} onClick={() => onMarketClick(market)} />
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {markets.map(m => (
+                <MarketCard key={m.market_id} market={m} onClick={() => handleMarketClick(m)} />
               ))}
             </div>
           )}
-        </section>
+        </div>
       </main>
 
-      {/* Footer */}
-      <footer className="border-t border-white/5 py-8 mt-20">
-        <p className="text-center text-sm text-zinc-600">
-          Powered by GenLayer Intelligent Contracts
-        </p>
-      </footer>
-
       {/* Modals */}
-      {modal === 'create' && (
-        <CreateModal onClose={() => setModal(null)} onCreate={handleCreateMarket} />
+      {showCreate && (
+        <CreateModal 
+          onClose={() => setShowCreate(false)} 
+          onSuccess={() => { setShowCreate(false); load(); }} 
+        />
       )}
       
-      {modal === 'bet' && selectedMarket && (
-        <BetModal
-          market={selectedMarket}
-          onClose={() => { setModal(null); setSelectedMarket(null); }}
-          onBet={(pos, amt) => handlePlaceBet(selectedMarket.market_id, pos, amt)}
+      {showBet && selectedMarket && (
+        <BetModal 
+          market={selectedMarket} 
+          onClose={() => setShowBet(false)} 
+          onSuccess={() => { setShowBet(false); load(); }} 
         />
       )}
     </div>
@@ -447,242 +358,270 @@ export default function Home() {
 // ============ MARKET CARD ============
 function MarketCard({ market, onClick }: { market: Market; onClick: () => void }) {
   const threshold = parseFloat(market.threshold);
-  const pool = parseInt(market.yes_pool || '0') + parseInt(market.no_pool || '0');
+  const timeLeft = parseInt(market.resolution_timestamp) * 1000 - Date.now();
+  const isExpired = timeLeft <= 0;
   
+  const icons: Record<string, string> = {
+    BTC: '₿', ETH: 'Ξ', SOL: '◎', BNB: '🔶', XRP: '✕', ADA: '₳', DOGE: '🐕'
+  };
+
   return (
-    <div
+    <div 
       onClick={onClick}
-      className="bg-white/[0.02] border border-white/5 rounded-xl p-6 cursor-pointer hover:bg-white/[0.04] hover:border-white/10 transition"
+      className={`card cursor-pointer hover:border-zinc-600 transition-all ${market.resolved ? 'opacity-60' : ''}`}
     >
-      <div className="flex justify-between items-start mb-4">
-        <div>
-          <h3 className="text-lg font-bold text-white">{market.asset}/USD</h3>
-          <p className="text-sm text-zinc-500">#{market.market_id}</p>
+      <div className="flex items-start justify-between mb-4">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-full bg-zinc-800 flex items-center justify-center text-lg">
+            {icons[market.asset] || market.asset[0]}
+          </div>
+          <div>
+            <h3 className="font-semibold">{market.asset}/USD</h3>
+            <p className="text-sm text-zinc-500">#{market.market_id}</p>
+          </div>
         </div>
-        <span className={`text-xs px-2 py-1 rounded-full font-medium ${
-          market.resolved 
-            ? 'bg-emerald-500/10 text-emerald-400' 
-            : 'bg-blue-500/10 text-blue-400'
-        }`}>
-          {market.resolved ? market.outcome : 'Active'}
-        </span>
+        {market.resolved ? (
+          <span className={`px-2 py-1 rounded text-xs font-medium ${
+            market.outcome === 'YES' ? 'bg-green-500/20 text-green-400' :
+            market.outcome === 'NO' ? 'bg-red-500/20 text-red-400' :
+            'bg-zinc-700 text-zinc-400'
+          }`}>
+            {market.outcome}
+          </span>
+        ) : (
+          <span className={`px-2 py-1 rounded text-xs font-medium ${
+            isExpired ? 'bg-yellow-500/20 text-yellow-400' : 'bg-blue-500/20 text-blue-400'
+          }`}>
+            {isExpired ? 'Awaiting Resolution' : formatTime(timeLeft)}
+          </span>
+        )}
       </div>
       
-      <p className="text-zinc-400 mb-4">
-        Price{' '}
-        <span className={market.condition === 'above' ? 'text-emerald-400' : 'text-red-400'}>
+      <p className="text-zinc-300 mb-4">
+        Price will be <span className={market.condition === 'above' ? 'text-green-400' : 'text-red-400'}>
           {market.condition}
-        </span>{' '}
-        <span className="text-white font-mono">${threshold.toLocaleString()}</span>
+        </span> <span className="font-mono font-bold">${threshold.toLocaleString()}</span>
       </p>
       
-      <p className="text-sm text-zinc-500">Pool: {pool} GEN</p>
+      <div className="flex justify-between text-sm text-zinc-500">
+        <span>YES: {market.yes_pool} wei</span>
+        <span>NO: {market.no_pool} wei</span>
+      </div>
     </div>
   );
 }
 
 // ============ CREATE MODAL ============
-function CreateModal({ onClose, onCreate }: { 
-  onClose: () => void; 
-  onCreate: (asset: string, condition: string, threshold: number, duration: number) => void;
-}) {
+function CreateModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
   const [asset, setAsset] = useState('BTC');
   const [condition, setCondition] = useState('above');
   const [threshold, setThreshold] = useState('50000');
   const [duration, setDuration] = useState(86400);
-  const [loading, setLoading] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const handleSubmit = async () => {
-    const t = parseFloat(threshold);
-    if (!t || t <= 0) return;
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
     
-    setLoading(true);
-    await onCreate(asset, condition, t, duration);
-    setLoading(false);
+    const priceValue = parseFloat(threshold);
+    if (!threshold || isNaN(priceValue) || priceValue <= 0) {
+      setError('Please enter a valid price');
+      return;
+    }
+    
+    setSubmitting(true);
+    try {
+      const ts = Math.floor(Date.now() / 1000) + duration;
+      await createMarket(asset, condition, priceValue, ts);
+      onSuccess();
+    } catch (e: any) {
+      console.error('Create market error:', e);
+      setError(e.message || 'Failed to create market');
+    }
+    setSubmitting(false);
   };
 
   return (
-    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50" onClick={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="bg-[#12121a] border border-white/10 rounded-2xl w-full max-w-md">
-        <div className="p-6 border-b border-white/5 flex justify-between items-center">
-          <h2 className="text-xl font-bold text-white">Create Market</h2>
-          <button onClick={onClose} className="text-zinc-500 hover:text-white text-2xl">&times;</button>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="bg-zinc-900 border border-zinc-800 rounded-2xl w-full max-w-md">
+        <div className="flex justify-between items-center p-5 border-b border-zinc-800">
+          <h2 className="text-xl font-semibold">Create Market</h2>
+          <button onClick={onClose} className="text-zinc-400 hover:text-white text-2xl">&times;</button>
         </div>
         
-        <div className="p-6 space-y-5">
+        <form onSubmit={submit} className="p-5 space-y-4">
           <div>
-            <label className="block text-sm text-zinc-400 mb-2">Asset</label>
-            <select 
-              value={asset} 
-              onChange={(e) => setAsset(e.target.value)}
-              className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-blue-500"
-            >
-              <option value="BTC">Bitcoin (BTC)</option>
-              <option value="ETH">Ethereum (ETH)</option>
-              <option value="SOL">Solana (SOL)</option>
+            <label className="block text-sm text-zinc-400 mb-1">Asset</label>
+            <select value={asset} onChange={e => setAsset(e.target.value)} className="select">
+              <option value="BTC">BTC - Bitcoin</option>
+              <option value="ETH">ETH - Ethereum</option>
+              <option value="SOL">SOL - Solana</option>
             </select>
           </div>
 
           <div>
-            <label className="block text-sm text-zinc-400 mb-2">Condition</label>
+            <label className="block text-sm text-zinc-400 mb-1">Condition</label>
             <div className="grid grid-cols-2 gap-3">
-              <button
-                onClick={() => setCondition('above')}
-                className={`py-3 rounded-lg border-2 font-medium transition ${
-                  condition === 'above' 
-                    ? 'border-emerald-500 bg-emerald-500/10 text-emerald-400' 
-                    : 'border-white/10 text-zinc-400 hover:border-white/20'
-                }`}
-              >
+              <button type="button" onClick={() => setCondition('above')}
+                className={`p-3 rounded-lg border-2 ${condition === 'above' ? 'border-green-500 bg-green-500/10' : 'border-zinc-700'}`}>
                 ↑ Above
               </button>
-              <button
-                onClick={() => setCondition('below')}
-                className={`py-3 rounded-lg border-2 font-medium transition ${
-                  condition === 'below' 
-                    ? 'border-red-500 bg-red-500/10 text-red-400' 
-                    : 'border-white/10 text-zinc-400 hover:border-white/20'
-                }`}
-              >
+              <button type="button" onClick={() => setCondition('below')}
+                className={`p-3 rounded-lg border-2 ${condition === 'below' ? 'border-red-500 bg-red-500/10' : 'border-zinc-700'}`}>
                 ↓ Below
               </button>
             </div>
           </div>
 
           <div>
-            <label className="block text-sm text-zinc-400 mb-2">Price (USD)</label>
-            <input
-              type="number"
-              value={threshold}
-              onChange={(e) => setThreshold(e.target.value)}
-              className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-blue-500"
+            <label className="block text-sm text-zinc-400 mb-1">Price (USD)</label>
+            <input 
+              type="number" 
+              value={threshold} 
+              onChange={e => setThreshold(e.target.value)} 
+              className="input"
+              min="0"
+              step="any"
             />
+            <p className="text-xs text-zinc-500 mt-1">
+              Predict if {asset} will be {condition} ${threshold || '0'} USD
+            </p>
           </div>
 
           <div>
-            <label className="block text-sm text-zinc-400 mb-2">Duration</label>
-            <select
-              value={duration}
-              onChange={(e) => setDuration(Number(e.target.value))}
-              className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-blue-500"
-            >
+            <label className="block text-sm text-zinc-400 mb-1">Duration</label>
+            <select value={duration} onChange={e => setDuration(Number(e.target.value))} className="select">
               <option value={3600}>1 Hour</option>
               <option value={86400}>1 Day</option>
               <option value={604800}>1 Week</option>
             </select>
           </div>
 
-          <button
-            onClick={handleSubmit}
-            disabled={loading}
-            className="w-full py-3.5 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-xl transition disabled:opacity-50"
-          >
-            {loading ? 'Creating...' : 'Create Market'}
+          {error && <p className="text-red-400 text-sm bg-red-500/10 p-2 rounded">{error}</p>}
+
+          <button type="submit" disabled={submitting} className="btn btn-primary w-full py-3">
+            {submitting ? 'Creating...' : 'Create Market'}
           </button>
-        </div>
+        </form>
       </div>
     </div>
   );
 }
 
 // ============ BET MODAL ============
-function BetModal({ market, onClose, onBet }: { 
-  market: Market; 
-  onClose: () => void; 
-  onBet: (position: string, amount: number) => void;
-}) {
+function BetModal({ market, onClose, onSuccess }: { market: Market; onClose: () => void; onSuccess: () => void }) {
   const [position, setPosition] = useState('YES');
-  const [amount, setAmount] = useState('0.1');
-  const [loading, setLoading] = useState(false);
+  const [amount, setAmount] = useState('');
+  const [odds, setOdds] = useState<Odds | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState(false);
 
-  const handleSubmit = async () => {
-    const a = parseFloat(amount);
-    if (!a || a <= 0) return;
-    
-    setLoading(true);
-    await onBet(position, a);
-    setLoading(false);
+  useEffect(() => {
+    fetchOdds(market.market_id).then(setOdds);
+  }, [market.market_id]);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!amount || parseFloat(amount) <= 0) { 
+      setError('Enter valid amount'); 
+      return; 
+    }
+
+    setSubmitting(true);
+    setError(null);
+    try {
+      const wei = BigInt(Math.floor(parseFloat(amount) * 1e18));
+      await placeBet(market.market_id, position, wei);
+      setSuccess(true);
+    } catch (e: any) {
+      console.error('Place bet error:', e);
+      setError(e.message || 'Failed to place bet');
+    }
+    setSubmitting(false);
   };
+
+  if (success) {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+        <div className="bg-zinc-900 border border-zinc-800 rounded-2xl w-full max-w-md p-8 text-center">
+          <div className="w-16 h-16 bg-green-500/20 rounded-full flex items-center justify-center mx-auto mb-4">
+            <span className="text-3xl">✓</span>
+          </div>
+          <h3 className="text-xl font-semibold mb-2">Bet Placed!</h3>
+          <p className="text-zinc-400 mb-6">Your {position} bet of {amount} GEN was successful.</p>
+          <button onClick={onSuccess} className="btn btn-primary">Close</button>
+        </div>
+      </div>
+    );
+  }
 
   const threshold = parseFloat(market.threshold);
 
   return (
-    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50" onClick={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="bg-[#12121a] border border-white/10 rounded-2xl w-full max-w-md">
-        <div className="p-6 border-b border-white/5 flex justify-between items-center">
-          <h2 className="text-xl font-bold text-white">Place Bet</h2>
-          <button onClick={onClose} className="text-zinc-500 hover:text-white text-2xl">&times;</button>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="bg-zinc-900 border border-zinc-800 rounded-2xl w-full max-w-md">
+        <div className="flex justify-between items-center p-5 border-b border-zinc-800">
+          <h2 className="text-xl font-semibold">Place Bet</h2>
+          <button onClick={onClose} className="text-zinc-400 hover:text-white text-2xl">&times;</button>
         </div>
         
-        <div className="p-6 space-y-5">
-          <div className="bg-white/5 rounded-xl p-4">
-            <h3 className="font-bold text-white">{market.asset}/USD</h3>
-            <p className="text-zinc-400">
-              Price{' '}
-              <span className={market.condition === 'above' ? 'text-emerald-400' : 'text-red-400'}>
-                {market.condition}
-              </span>{' '}
-              <span className="text-white font-mono">${threshold.toLocaleString()}</span>
+        <form onSubmit={submit} className="p-5 space-y-4">
+          <div className="bg-zinc-800/50 rounded-lg p-4">
+            <h3 className="font-semibold">{market.asset}/USD</h3>
+            <p className="text-zinc-400 text-sm">
+              Price will be <span className={market.condition === 'above' ? 'text-green-400' : 'text-red-400'}>{market.condition}</span>{' '}
+              <span className="font-mono font-bold">${threshold.toLocaleString()}</span>
             </p>
           </div>
 
           <div>
-            <label className="block text-sm text-zinc-400 mb-2">Your Prediction</label>
+            <label className="block text-sm text-zinc-400 mb-1">Your Prediction</label>
             <div className="grid grid-cols-2 gap-3">
-              <button
-                onClick={() => setPosition('YES')}
-                className={`py-4 rounded-lg border-2 font-medium transition ${
-                  position === 'YES' 
-                    ? 'border-emerald-500 bg-emerald-500/10 text-emerald-400' 
-                    : 'border-white/10 text-zinc-400 hover:border-white/20'
-                }`}
-              >
-                YES ↑
+              <button type="button" onClick={() => setPosition('YES')}
+                className={`p-3 rounded-lg border-2 ${position === 'YES' ? 'border-green-500 bg-green-500/10' : 'border-zinc-700'}`}>
+                ↑ YES {odds && <span className="text-sm text-zinc-500">({odds.yes_probability}%)</span>}
               </button>
-              <button
-                onClick={() => setPosition('NO')}
-                className={`py-4 rounded-lg border-2 font-medium transition ${
-                  position === 'NO' 
-                    ? 'border-red-500 bg-red-500/10 text-red-400' 
-                    : 'border-white/10 text-zinc-400 hover:border-white/20'
-                }`}
-              >
-                NO ↓
+              <button type="button" onClick={() => setPosition('NO')}
+                className={`p-3 rounded-lg border-2 ${position === 'NO' ? 'border-red-500 bg-red-500/10' : 'border-zinc-700'}`}>
+                ↓ NO {odds && <span className="text-sm text-zinc-500">({odds.no_probability}%)</span>}
               </button>
             </div>
           </div>
 
           <div>
-            <label className="block text-sm text-zinc-400 mb-2">Amount (GEN)</label>
-            <input
-              type="number"
-              value={amount}
-              onChange={(e) => setAmount(e.target.value)}
-              step="0.01"
-              className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-blue-500"
-            />
+            <label className="block text-sm text-zinc-400 mb-1">Amount (GEN)</label>
+            <input type="number" value={amount} onChange={e => setAmount(e.target.value)} placeholder="0.00" step="0.001" className="input" />
           </div>
 
-          <button
-            onClick={handleSubmit}
-            disabled={loading}
-            className="w-full py-3.5 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-xl transition disabled:opacity-50"
-          >
-            {loading ? 'Placing Bet...' : 'Place Bet'}
+          {error && <p className="text-red-400 text-sm bg-red-500/10 p-2 rounded">{error}</p>}
+
+          <button type="submit" disabled={submitting} className="btn btn-primary w-full py-3">
+            {submitting ? 'Placing Bet...' : 'Place Bet'}
           </button>
-        </div>
+        </form>
       </div>
     </div>
   );
 }
 
-// ============ TYPES ============
+// ============ HELPERS ============
+function formatTime(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  const d = Math.floor(h / 24);
+  return `${d}d`;
+}
+
 declare global {
   interface Window {
     ethereum?: {
       request: (args: { method: string; params?: any[] }) => Promise<any>;
-      on?: (event: string, handler: (...args: any[]) => void) => void;
-      removeListener?: (event: string, handler: (...args: any[]) => void) => void;
     };
   }
 }
