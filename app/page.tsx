@@ -6,6 +6,7 @@ import { studionet } from 'genlayer-js/chains';
 
 // ============ CONFIG ============
 const CONTRACT = '0x7d15C521f4A463Dc833d550e66635e9BE5063Eb4';
+const RPC_URL = 'https://studio.genlayer.com/api';
 
 // ============ TYPES ============
 interface Market {
@@ -33,7 +34,55 @@ interface Odds {
   total_pool: number;
 }
 
-// ============ GENLAYER CLIENT ============
+interface Toast {
+  id: number;
+  type: 'success' | 'error' | 'info';
+  message: string;
+}
+
+// ============ DIRECT JSON-RPC CALLS ============
+async function callContract(method: string, args: any[] = []): Promise<any> {
+  try {
+    const response = await fetch(RPC_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'gen_call',
+        params: {
+          to: CONTRACT,
+          function: method,
+          args: args,
+        },
+        id: Date.now(),
+      }),
+    });
+    
+    const data = await response.json();
+    console.log(`${method} response:`, data);
+    
+    if (data.error) {
+      throw new Error(data.error.message || 'RPC Error');
+    }
+    
+    // Parse the result
+    let result = data.result;
+    if (typeof result === 'string') {
+      try {
+        result = JSON.parse(result);
+      } catch {
+        // Not JSON, return as-is
+      }
+    }
+    
+    return result;
+  } catch (e) {
+    console.error(`${method} error:`, e);
+    throw e;
+  }
+}
+
+// ============ GENLAYER CLIENT FOR WRITE ============
 let client: ReturnType<typeof createClient> | null = null;
 let currentWallet: string | null = null;
 
@@ -57,27 +106,20 @@ async function connectWallet(): Promise<string> {
   return currentWallet;
 }
 
-function getReadClient() {
-  return createClient({ chain: studionet });
-}
-
-// Verify wallet connection with zero-value deduction check
 async function verifyDeduction(): Promise<boolean> {
-  if (typeof window === 'undefined' || !window.ethereum) {
+  if (typeof window === 'undefined' || !window.ethereum || !currentWallet) {
     return false;
   }
   
   try {
-    // Check if wallet is still connected (zero-value verification)
     const accounts = await window.ethereum.request({ 
       method: 'eth_accounts' 
     }) as string[];
     
-    if (!accounts?.length || accounts[0].toLowerCase() !== currentWallet?.toLowerCase()) {
+    if (!accounts?.length || accounts[0].toLowerCase() !== currentWallet.toLowerCase()) {
       return false;
     }
     
-    // Simulate zero-value deduction by checking balance access
     await window.ethereum.request({
       method: 'eth_getBalance',
       params: [accounts[0], 'latest']
@@ -90,40 +132,15 @@ async function verifyDeduction(): Promise<boolean> {
   }
 }
 
-function safeParseJSON(data: unknown): any {
-  if (typeof data === 'string') {
-    try {
-      // Handle potential double-encoded JSON
-      let parsed = JSON.parse(data);
-      if (typeof parsed === 'string') {
-        try {
-          parsed = JSON.parse(parsed);
-        } catch {
-          // Not double-encoded, use first parse result
-        }
-      }
-      return parsed;
-    } catch {
-      return data;
-    }
-  }
-  return data;
-}
-
+// ============ DATA FETCHING ============
 async function fetchStats(): Promise<Stats> {
-  const c = getReadClient();
   try {
-    const r = await c.readContract({ 
-      address: CONTRACT as `0x${string}`, 
-      functionName: 'get_stats', 
-      args: [] 
-    });
-    const parsed = safeParseJSON(r);
+    const result = await callContract('get_stats');
     return {
-      total_markets: Number(parsed?.total_markets) || 0,
-      active_markets: Number(parsed?.active_markets) || 0,
-      resolved_markets: Number(parsed?.resolved_markets) || 0,
-      total_volume: Number(parsed?.total_volume) || 0,
+      total_markets: Number(result?.total_markets) || 0,
+      active_markets: Number(result?.active_markets) || 0,
+      resolved_markets: Number(result?.resolved_markets) || 0,
+      total_volume: Number(result?.total_volume) || 0,
     };
   } catch (e) {
     console.error('fetchStats error:', e);
@@ -132,27 +149,28 @@ async function fetchStats(): Promise<Stats> {
 }
 
 async function fetchMarkets(): Promise<Market[]> {
-  const c = getReadClient();
   try {
-    const idsResult = await c.readContract({ 
-      address: CONTRACT as `0x${string}`, 
-      functionName: 'get_all_market_ids', 
-      args: [] 
-    });
-    const ids = safeParseJSON(idsResult);
+    const ids = await callContract('get_all_market_ids');
     
-    if (!Array.isArray(ids)) return [];
+    if (!Array.isArray(ids) || ids.length === 0) return [];
     
     const markets: Market[] = [];
     for (const id of ids) {
       try {
-        const m = await c.readContract({ 
-          address: CONTRACT as `0x${string}`, 
-          functionName: 'get_market', 
-          args: [String(id)] 
-        });
-        const parsed = safeParseJSON(m);
-        if (parsed?.market_id) markets.push(parsed);
+        const m = await callContract('get_market', [String(id)]);
+        if (m?.market_id) {
+          markets.push({
+            market_id: String(m.market_id),
+            asset: String(m.asset || ''),
+            condition: String(m.condition || ''),
+            threshold: String(m.threshold || '0'),
+            resolution_timestamp: String(m.resolution_timestamp || '0'),
+            yes_pool: String(m.yes_pool || '0'),
+            no_pool: String(m.no_pool || '0'),
+            resolved: Boolean(m.resolved),
+            outcome: String(m.outcome || ''),
+          });
+        }
       } catch (e) {
         console.error(`fetchMarket ${id} error:`, e);
       }
@@ -165,18 +183,12 @@ async function fetchMarkets(): Promise<Market[]> {
 }
 
 async function fetchOdds(id: string): Promise<Odds> {
-  const c = getReadClient();
   try {
-    const r = await c.readContract({ 
-      address: CONTRACT as `0x${string}`, 
-      functionName: 'get_market_odds', 
-      args: [id] 
-    });
-    const parsed = safeParseJSON(r);
+    const result = await callContract('get_market_odds', [id]);
     return {
-      yes_probability: Number(parsed?.yes_probability) || 50,
-      no_probability: Number(parsed?.no_probability) || 50,
-      total_pool: Number(parsed?.total_pool) || 0,
+      yes_probability: Number(result?.yes_probability) || 50,
+      no_probability: Number(result?.no_probability) || 50,
+      total_pool: Number(result?.total_pool) || 0,
     };
   } catch (e) {
     console.error('fetchOdds error:', e);
@@ -186,8 +198,6 @@ async function fetchOdds(id: string): Promise<Odds> {
 
 async function createMarket(asset: string, condition: string, threshold: number, timestamp: number) {
   if (!client) throw new Error('Wallet not connected');
-  
-  console.log('Creating market:', { asset, condition, threshold, timestamp });
   
   const tx = await client.writeContract({
     address: CONTRACT as `0x${string}`,
@@ -210,8 +220,6 @@ async function createMarket(asset: string, condition: string, threshold: number,
 async function placeBet(id: string, position: string, amount: bigint) {
   if (!client) throw new Error('Wallet not connected');
   
-  console.log('Placing bet:', { id, position, amount: amount.toString() });
-  
   const tx = await client.writeContract({
     address: CONTRACT as `0x${string}`,
     functionName: 'place_bet',
@@ -219,15 +227,52 @@ async function placeBet(id: string, position: string, amount: bigint) {
     value: amount,
   });
   
-  console.log('TX Hash:', tx);
-  
   const receipt = await client.waitForTransactionReceipt({ 
     hash: tx, 
     status: 'FINALIZED' 
   });
   
-  console.log('Receipt:', receipt);
   return receipt;
+}
+
+// ============ TOAST COMPONENT ============
+function ToastContainer({ toasts, removeToast }: { toasts: Toast[]; removeToast: (id: number) => void }) {
+  return (
+    <div className="fixed bottom-6 right-6 z-[100] flex flex-col gap-3">
+      {toasts.map(toast => (
+        <div 
+          key={toast.id}
+          className={`flex items-center gap-3 px-5 py-4 rounded-xl shadow-2xl backdrop-blur-md animate-slide-in ${
+            toast.type === 'success' ? 'bg-emerald-500/90 text-white' :
+            toast.type === 'error' ? 'bg-red-500/90 text-white' :
+            'bg-indigo-500/90 text-white'
+          }`}
+        >
+          {toast.type === 'success' && (
+            <svg className="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+            </svg>
+          )}
+          {toast.type === 'error' && (
+            <svg className="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          )}
+          {toast.type === 'info' && (
+            <svg className="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+          )}
+          <span className="font-medium">{toast.message}</span>
+          <button onClick={() => removeToast(toast.id)} className="ml-2 opacity-70 hover:opacity-100">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 // ============ MAIN PAGE ============
@@ -238,10 +283,23 @@ export default function Page() {
   const [markets, setMarkets] = useState<Market[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [toasts, setToasts] = useState<Toast[]>([]);
   
   const [showCreate, setShowCreate] = useState(false);
   const [showBet, setShowBet] = useState(false);
   const [selectedMarket, setSelectedMarket] = useState<Market | null>(null);
+
+  const addToast = useCallback((type: Toast['type'], message: string) => {
+    const id = Date.now();
+    setToasts(prev => [...prev, { id, type, message }]);
+    setTimeout(() => {
+      setToasts(prev => prev.filter(t => t.id !== id));
+    }, 5000);
+  }, []);
+
+  const removeToast = useCallback((id: number) => {
+    setToasts(prev => prev.filter(t => t.id !== id));
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -264,8 +322,10 @@ export default function Page() {
     try {
       const addr = await connectWallet();
       setAddress(addr);
+      addToast('success', 'Wallet connected successfully');
     } catch (e: any) {
       setError(e.message);
+      addToast('error', e.message);
     }
     setConnecting(false);
   };
@@ -274,19 +334,21 @@ export default function Page() {
     client = null;
     currentWallet = null;
     setAddress(null);
+    addToast('info', 'Wallet disconnected');
   };
 
   const handleMarketClick = async (m: Market) => {
     setError(null);
     if (!address) { 
-      setError('Please connect your wallet first'); 
+      setError('Please connect your wallet first');
+      addToast('error', 'Please connect your wallet first');
       return; 
     }
     
-    // Zero-value deduction check
     const verified = await verifyDeduction();
     if (!verified) {
       setError('Deduction failed');
+      addToast('error', 'Deduction failed');
       return;
     }
     
@@ -297,22 +359,44 @@ export default function Page() {
   const handleCreateClick = async () => {
     setError(null);
     if (!address) { 
-      setError('Please connect your wallet first'); 
+      setError('Please connect your wallet first');
+      addToast('error', 'Please connect your wallet first');
       return; 
     }
     
-    // Zero-value deduction check
     const verified = await verifyDeduction();
     if (!verified) {
       setError('Deduction failed');
+      addToast('error', 'Deduction failed');
       return;
     }
     
     setShowCreate(true);
   };
 
+  const handleCreateSuccess = useCallback(async () => {
+    setShowCreate(false);
+    addToast('success', 'Market created successfully!');
+    
+    // Wait a moment for the blockchain to update
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    await load();
+  }, [addToast, load]);
+
+  const handleBetSuccess = useCallback(async () => {
+    setShowBet(false);
+    setSelectedMarket(null);
+    addToast('success', 'Bet placed successfully!');
+    
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    await load();
+  }, [addToast, load]);
+
   return (
     <div className="min-h-screen bg-[#0a0a0f]">
+      {/* Toast Notifications */}
+      <ToastContainer toasts={toasts} removeToast={removeToast} />
+      
       {/* Header */}
       <header className="fixed top-0 left-0 right-0 z-50 bg-[#0a0a0f]/90 backdrop-blur-md border-b border-white/5">
         <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
@@ -370,13 +454,14 @@ export default function Page() {
               </button>
               <button 
                 onClick={load} 
-                className="px-8 py-4 bg-white/5 hover:bg-white/10 border border-white/10 hover:border-white/20 rounded-2xl font-semibold transition-all hover:scale-[1.02] active:scale-[0.98]"
+                disabled={loading}
+                className="px-8 py-4 bg-white/5 hover:bg-white/10 border border-white/10 hover:border-white/20 rounded-2xl font-semibold transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50"
               >
                 <span className="flex items-center gap-2">
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <svg className={`w-5 h-5 ${loading ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                   </svg>
-                  Refresh
+                  {loading ? 'Loading...' : 'Refresh'}
                 </span>
               </button>
             </div>
@@ -435,7 +520,13 @@ export default function Page() {
             <div className="text-center py-20 border border-dashed border-white/10 rounded-2xl">
               <div className="text-5xl mb-4">🎯</div>
               <p className="text-xl font-medium mb-2">No markets yet</p>
-              <p className="text-zinc-500">Be the first to create a prediction market!</p>
+              <p className="text-zinc-500 mb-6">Be the first to create a prediction market!</p>
+              <button 
+                onClick={handleCreateClick}
+                className="px-6 py-3 bg-gradient-to-r from-indigo-500 to-purple-500 rounded-xl font-medium"
+              >
+                Create Your First Market
+              </button>
             </div>
           ) : (
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -451,15 +542,17 @@ export default function Page() {
       {showCreate && (
         <CreateModal 
           onClose={() => setShowCreate(false)} 
-          onSuccess={() => { setShowCreate(false); load(); }} 
+          onSuccess={handleCreateSuccess}
+          addToast={addToast}
         />
       )}
       
       {showBet && selectedMarket && (
         <BetModal 
           market={selectedMarket} 
-          onClose={() => setShowBet(false)} 
-          onSuccess={() => { setShowBet(false); load(); }} 
+          onClose={() => { setShowBet(false); setSelectedMarket(null); }} 
+          onSuccess={handleBetSuccess}
+          addToast={addToast}
         />
       )}
     </div>
@@ -483,7 +576,7 @@ function MarketCard({ market, onClick }: { market: Market; onClick: () => void }
   return (
     <div 
       onClick={onClick}
-      className={`group p-6 bg-white/[0.02] border border-white/5 rounded-2xl cursor-pointer hover:bg-white/[0.04] hover:border-white/10 transition-all ${market.resolved ? 'opacity-60' : ''}`}
+      className={`group p-6 bg-white/[0.02] border border-white/5 rounded-2xl cursor-pointer hover:bg-white/[0.04] hover:border-white/10 transition-all hover:scale-[1.01] ${market.resolved ? 'opacity-60' : ''}`}
     >
       <div className="flex items-start justify-between mb-4">
         <div className="flex items-center gap-3">
@@ -535,13 +628,19 @@ function MarketCard({ market, onClick }: { market: Market; onClick: () => void }
 }
 
 // ============ CREATE MODAL ============
-function CreateModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
+function CreateModal({ onClose, onSuccess, addToast }: { 
+  onClose: () => void; 
+  onSuccess: () => void;
+  addToast: (type: Toast['type'], message: string) => void;
+}) {
   const [asset, setAsset] = useState('BTC');
   const [condition, setCondition] = useState('above');
   const [threshold, setThreshold] = useState('50000');
   const [duration, setDuration] = useState(86400);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [step, setStep] = useState<'form' | 'pending' | 'success'>('form');
+  const [txHash, setTxHash] = useState<string | null>(null);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -554,13 +653,18 @@ function CreateModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: (
     }
     
     setSubmitting(true);
+    setStep('pending');
+    
     try {
       const ts = Math.floor(Date.now() / 1000) + duration;
-      await createMarket(asset, condition, priceValue, ts);
-      onSuccess();
+      const receipt = await createMarket(asset, condition, priceValue, ts);
+      setTxHash(receipt?.hash || null);
+      setStep('success');
     } catch (e: any) {
       console.error('Create market error:', e);
       setError(e.message || 'Failed to create market');
+      setStep('form');
+      addToast('error', 'Failed to create market');
     }
     setSubmitting(false);
   };
@@ -571,9 +675,66 @@ function CreateModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: (
     { value: 'SOL', label: 'Solana', icon: '◎' },
   ];
 
+  // Success view
+  if (step === 'success') {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+        <div className="bg-[#12121a] border border-white/10 rounded-3xl w-full max-w-md p-8 text-center shadow-2xl animate-scale-in">
+          <div className="w-20 h-20 bg-emerald-500/20 rounded-full flex items-center justify-center mx-auto mb-6">
+            <svg className="w-10 h-10 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+            </svg>
+          </div>
+          <h3 className="text-2xl font-bold mb-2">Market Created!</h3>
+          <p className="text-zinc-400 mb-4">
+            Your prediction market for <span className="text-white font-semibold">{asset}</span> has been created.
+          </p>
+          <div className="bg-white/5 rounded-xl p-4 mb-6 text-left">
+            <div className="text-sm text-zinc-500 mb-1">Prediction</div>
+            <div className="text-white">
+              {asset} will be <span className={condition === 'above' ? 'text-emerald-400' : 'text-red-400'}>{condition}</span> ${parseFloat(threshold).toLocaleString()}
+            </div>
+            {txHash && (
+              <>
+                <div className="text-sm text-zinc-500 mt-3 mb-1">Transaction</div>
+                <div className="text-xs font-mono text-zinc-400 break-all">{txHash}</div>
+              </>
+            )}
+          </div>
+          <button 
+            onClick={onSuccess} 
+            className="w-full py-4 bg-gradient-to-r from-indigo-500 to-purple-500 rounded-xl font-semibold"
+          >
+            View Markets
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Pending view
+  if (step === 'pending') {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+        <div className="bg-[#12121a] border border-white/10 rounded-3xl w-full max-w-md p-8 text-center shadow-2xl">
+          <div className="w-20 h-20 bg-indigo-500/20 rounded-full flex items-center justify-center mx-auto mb-6">
+            <svg className="w-10 h-10 text-indigo-400 animate-spin" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+          </div>
+          <h3 className="text-2xl font-bold mb-2">Creating Market...</h3>
+          <p className="text-zinc-400 mb-2">Please confirm the transaction in MetaMask</p>
+          <p className="text-zinc-500 text-sm">This may take a few moments</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Form view
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4" onClick={e => e.target === e.currentTarget && onClose()}>
-      <div className="bg-[#12121a] border border-white/10 rounded-3xl w-full max-w-md shadow-2xl">
+      <div className="bg-[#12121a] border border-white/10 rounded-3xl w-full max-w-md shadow-2xl animate-scale-in">
         <div className="flex justify-between items-center p-6 border-b border-white/5">
           <h2 className="text-xl font-semibold">Create Market</h2>
           <button onClick={onClose} className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-white/10 transition-colors">
@@ -685,15 +846,7 @@ function CreateModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: (
             disabled={submitting} 
             className="w-full py-4 bg-gradient-to-r from-indigo-500 to-purple-500 hover:from-indigo-600 hover:to-purple-600 rounded-xl font-semibold shadow-lg shadow-indigo-500/25 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {submitting ? (
-              <span className="flex items-center justify-center gap-2">
-                <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                </svg>
-                Creating...
-              </span>
-            ) : 'Create Market'}
+            Create Market
           </button>
         </form>
       </div>
@@ -702,13 +855,18 @@ function CreateModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: (
 }
 
 // ============ BET MODAL ============
-function BetModal({ market, onClose, onSuccess }: { market: Market; onClose: () => void; onSuccess: () => void }) {
+function BetModal({ market, onClose, onSuccess, addToast }: { 
+  market: Market; 
+  onClose: () => void; 
+  onSuccess: () => void;
+  addToast: (type: Toast['type'], message: string) => void;
+}) {
   const [position, setPosition] = useState('YES');
   const [amount, setAmount] = useState('');
   const [odds, setOdds] = useState<Odds | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState(false);
+  const [step, setStep] = useState<'form' | 'pending' | 'success'>('form');
 
   useEffect(() => {
     fetchOdds(market.market_id).then(setOdds);
@@ -723,31 +881,48 @@ function BetModal({ market, onClose, onSuccess }: { market: Market; onClose: () 
 
     setSubmitting(true);
     setError(null);
+    setStep('pending');
+    
     try {
       const wei = BigInt(Math.floor(parseFloat(amount) * 1e18));
       await placeBet(market.market_id, position, wei);
-      setSuccess(true);
+      setStep('success');
     } catch (e: any) {
       console.error('Place bet error:', e);
       setError(e.message || 'Failed to place bet');
+      setStep('form');
+      addToast('error', 'Failed to place bet');
     }
     setSubmitting(false);
   };
 
-  if (success) {
+  const threshold = parseFloat(market.threshold);
+
+  // Success view
+  if (step === 'success') {
     return (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-        <div className="bg-[#12121a] border border-white/10 rounded-3xl w-full max-w-md p-8 text-center shadow-2xl">
+        <div className="bg-[#12121a] border border-white/10 rounded-3xl w-full max-w-md p-8 text-center shadow-2xl animate-scale-in">
           <div className="w-20 h-20 bg-emerald-500/20 rounded-full flex items-center justify-center mx-auto mb-6">
             <svg className="w-10 h-10 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
             </svg>
           </div>
           <h3 className="text-2xl font-bold mb-2">Bet Placed!</h3>
-          <p className="text-zinc-400 mb-6">Your {position} bet of {amount} GEN was successful.</p>
+          <p className="text-zinc-400 mb-4">Your bet has been successfully placed.</p>
+          <div className="bg-white/5 rounded-xl p-4 mb-6">
+            <div className="flex justify-between mb-2">
+              <span className="text-zinc-500">Position</span>
+              <span className={`font-semibold ${position === 'YES' ? 'text-emerald-400' : 'text-red-400'}`}>{position}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-zinc-500">Amount</span>
+              <span className="font-semibold">{amount} GEN</span>
+            </div>
+          </div>
           <button 
             onClick={onSuccess} 
-            className="px-8 py-3 bg-gradient-to-r from-indigo-500 to-purple-500 rounded-xl font-semibold"
+            className="w-full py-4 bg-gradient-to-r from-indigo-500 to-purple-500 rounded-xl font-semibold"
           >
             Done
           </button>
@@ -756,11 +931,29 @@ function BetModal({ market, onClose, onSuccess }: { market: Market; onClose: () 
     );
   }
 
-  const threshold = parseFloat(market.threshold);
+  // Pending view
+  if (step === 'pending') {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+        <div className="bg-[#12121a] border border-white/10 rounded-3xl w-full max-w-md p-8 text-center shadow-2xl">
+          <div className="w-20 h-20 bg-indigo-500/20 rounded-full flex items-center justify-center mx-auto mb-6">
+            <svg className="w-10 h-10 text-indigo-400 animate-spin" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+          </div>
+          <h3 className="text-2xl font-bold mb-2">Placing Bet...</h3>
+          <p className="text-zinc-400 mb-2">Please confirm the transaction in MetaMask</p>
+          <p className="text-zinc-500 text-sm">This may take a few moments</p>
+        </div>
+      </div>
+    );
+  }
 
+  // Form view
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4" onClick={e => e.target === e.currentTarget && onClose()}>
-      <div className="bg-[#12121a] border border-white/10 rounded-3xl w-full max-w-md shadow-2xl">
+      <div className="bg-[#12121a] border border-white/10 rounded-3xl w-full max-w-md shadow-2xl animate-scale-in">
         <div className="flex justify-between items-center p-6 border-b border-white/5">
           <h2 className="text-xl font-semibold">Place Bet</h2>
           <button onClick={onClose} className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-white/10 transition-colors">
@@ -853,15 +1046,7 @@ function BetModal({ market, onClose, onSuccess }: { market: Market; onClose: () 
             disabled={submitting} 
             className="w-full py-4 bg-gradient-to-r from-indigo-500 to-purple-500 hover:from-indigo-600 hover:to-purple-600 rounded-xl font-semibold shadow-lg shadow-indigo-500/25 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {submitting ? (
-              <span className="flex items-center justify-center gap-2">
-                <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                </svg>
-                Placing Bet...
-              </span>
-            ) : 'Place Bet'}
+            Place Bet
           </button>
         </form>
       </div>
