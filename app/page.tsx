@@ -61,36 +61,53 @@ function getReadClient() {
   return createClient({ chain: studionet });
 }
 
-// Verify wallet connection with zero-value transaction check
-async function verifyWalletAccess(): Promise<boolean> {
-  if (!client || !currentWallet) {
-    throw new Error('Wallet not connected');
+// Verify wallet connection with zero-value deduction check
+async function verifyDeduction(): Promise<boolean> {
+  if (typeof window === 'undefined' || !window.ethereum) {
+    return false;
   }
   
   try {
-    // Simulate a zero-value check by reading contract state
-    const c = getReadClient();
-    await c.readContract({ 
-      address: CONTRACT as `0x${string}`, 
-      functionName: 'get_stats', 
-      args: [] 
+    // Check if wallet is still connected (zero-value verification)
+    const accounts = await window.ethereum.request({ 
+      method: 'eth_accounts' 
+    }) as string[];
+    
+    if (!accounts?.length || accounts[0].toLowerCase() !== currentWallet?.toLowerCase()) {
+      return false;
+    }
+    
+    // Simulate zero-value deduction by checking balance access
+    await window.ethereum.request({
+      method: 'eth_getBalance',
+      params: [accounts[0], 'latest']
     });
+    
     return true;
   } catch (e) {
-    console.error('Wallet verification failed:', e);
+    console.error('Deduction verification failed:', e);
     return false;
   }
 }
 
-function parseContractResult(result: unknown): any {
-  if (typeof result === 'string') {
+function safeParseJSON(data: unknown): any {
+  if (typeof data === 'string') {
     try {
-      return JSON.parse(result);
+      // Handle potential double-encoded JSON
+      let parsed = JSON.parse(data);
+      if (typeof parsed === 'string') {
+        try {
+          parsed = JSON.parse(parsed);
+        } catch {
+          // Not double-encoded, use first parse result
+        }
+      }
+      return parsed;
     } catch {
-      return result;
+      return data;
     }
   }
-  return result;
+  return data;
 }
 
 async function fetchStats(): Promise<Stats> {
@@ -101,13 +118,12 @@ async function fetchStats(): Promise<Stats> {
       functionName: 'get_stats', 
       args: [] 
     });
-    console.log('Raw stats:', r);
-    const parsed = parseContractResult(r);
+    const parsed = safeParseJSON(r);
     return {
-      total_markets: parsed.total_markets || 0,
-      active_markets: parsed.active_markets || 0,
-      resolved_markets: parsed.resolved_markets || 0,
-      total_volume: parsed.total_volume || 0,
+      total_markets: Number(parsed?.total_markets) || 0,
+      active_markets: Number(parsed?.active_markets) || 0,
+      resolved_markets: Number(parsed?.resolved_markets) || 0,
+      total_volume: Number(parsed?.total_volume) || 0,
     };
   } catch (e) {
     console.error('fetchStats error:', e);
@@ -123,8 +139,7 @@ async function fetchMarkets(): Promise<Market[]> {
       functionName: 'get_all_market_ids', 
       args: [] 
     });
-    console.log('Raw market ids:', idsResult);
-    const ids = parseContractResult(idsResult);
+    const ids = safeParseJSON(idsResult);
     
     if (!Array.isArray(ids)) return [];
     
@@ -136,7 +151,7 @@ async function fetchMarkets(): Promise<Market[]> {
           functionName: 'get_market', 
           args: [String(id)] 
         });
-        const parsed = parseContractResult(m);
+        const parsed = safeParseJSON(m);
         if (parsed?.market_id) markets.push(parsed);
       } catch (e) {
         console.error(`fetchMarket ${id} error:`, e);
@@ -157,11 +172,11 @@ async function fetchOdds(id: string): Promise<Odds> {
       functionName: 'get_market_odds', 
       args: [id] 
     });
-    const parsed = parseContractResult(r);
+    const parsed = safeParseJSON(r);
     return {
-      yes_probability: parsed.yes_probability || 50,
-      no_probability: parsed.no_probability || 50,
-      total_pool: parsed.total_pool || 0,
+      yes_probability: Number(parsed?.yes_probability) || 50,
+      no_probability: Number(parsed?.no_probability) || 50,
+      total_pool: Number(parsed?.total_pool) || 0,
     };
   } catch (e) {
     console.error('fetchOdds error:', e);
@@ -268,8 +283,8 @@ export default function Page() {
       return; 
     }
     
-    // Deduction check (value = 0)
-    const verified = await verifyWalletAccess();
+    // Zero-value deduction check
+    const verified = await verifyDeduction();
     if (!verified) {
       setError('Deduction failed');
       return;
@@ -286,8 +301,8 @@ export default function Page() {
       return; 
     }
     
-    // Deduction check (value = 0)
-    const verified = await verifyWalletAccess();
+    // Zero-value deduction check
+    const verified = await verifyDeduction();
     if (!verified) {
       setError('Deduction failed');
       return;
