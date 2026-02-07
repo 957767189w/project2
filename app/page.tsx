@@ -41,14 +41,17 @@ interface Toast {
 }
 
 // ============ DEEP JSON UNWRAP ============
-// GenLayer contract view methods return json.dumps() strings.
-// The SDK may return them as a raw string. We recursively parse
-// until we reach the actual JS object/array.
 function deepParse(val: any): any {
+  if (val === null || val === undefined) return val;
   if (typeof val !== 'string') return val;
+  
   let cur: any = val;
   for (let i = 0; i < 5; i++) {
     if (typeof cur !== 'string') break;
+    const trimmed = cur.trim();
+    if (!trimmed.startsWith('{') && !trimmed.startsWith('[') && !trimmed.startsWith('"')) {
+      break;
+    }
     try {
       cur = JSON.parse(cur);
     } catch {
@@ -58,10 +61,7 @@ function deepParse(val: any): any {
   return cur;
 }
 
-// ============ READ-ONLY CLIENT (no wallet needed) ============
-// genlayer-js SDK readContract handles all RPC encoding internally.
-// This replaces the broken raw fetch() calls that caused
-// "Unexpected parameter: to" error.
+// ============ READ-ONLY CLIENT ============
 const readClient = createClient({ chain: studionet });
 
 async function callRead(functionName: string, args: any[] = []): Promise<any> {
@@ -81,7 +81,7 @@ async function callRead(functionName: string, args: any[] = []): Promise<any> {
   }
 }
 
-// ============ WRITE CLIENT (needs MetaMask wallet) ============
+// ============ WRITE CLIENT ============
 let writeClient: ReturnType<typeof createClient> | null = null;
 let currentWallet: string | null = null;
 
@@ -106,8 +106,6 @@ async function connectWallet(): Promise<string> {
 }
 
 // ============ 0-GEN DEDUCTION VIA METAMASK ============
-// Sends a 0-value tx to self. User must click Confirm in MetaMask.
-// If rejected, returns false => shows "Deduction failed".
 async function verifyDeduction(): Promise<boolean> {
   if (typeof window === 'undefined' || !window.ethereum || !currentWallet) {
     return false;
@@ -131,7 +129,7 @@ async function verifyDeduction(): Promise<boolean> {
   }
 }
 
-// ============ DATA FETCHING (via SDK readContract) ============
+// ============ DATA FETCHING ============
 async function fetchStats(): Promise<Stats> {
   try {
     const result = await callRead('get_stats');
@@ -153,35 +151,65 @@ async function fetchStats(): Promise<Stats> {
 async function fetchMarkets(): Promise<Market[]> {
   try {
     let ids = await callRead('get_all_market_ids');
-    console.log('[fetch] ids:', ids, typeof ids);
+    console.log('[fetch] raw ids:', ids, typeof ids);
 
-    // Ensure we have an array
-    if (typeof ids === 'string') ids = deepParse(ids);
-    if (!Array.isArray(ids) || ids.length === 0) return [];
+    // Parse IDs if needed
+    if (typeof ids === 'string') {
+      ids = deepParse(ids);
+    }
+    
+    console.log('[fetch] parsed ids:', ids, Array.isArray(ids));
+
+    if (!Array.isArray(ids) || ids.length === 0) {
+      console.log('[fetch] no market ids found');
+      return [];
+    }
 
     const markets: Market[] = [];
+    
     for (const id of ids) {
       try {
-        let m = await callRead('get_market', [String(id)]);
-        if (typeof m === 'string') m = deepParse(m);
+        const marketId = String(id);
+        console.log(`[fetch] fetching market ${marketId}...`);
+        
+        let m = await callRead('get_market', [marketId]);
+        console.log(`[fetch] market ${marketId} raw:`, m);
+        
+        if (typeof m === 'string') {
+          m = deepParse(m);
+        }
+        
+        console.log(`[fetch] market ${marketId} parsed:`, m);
 
-        if (m && typeof m === 'object' && (m.market_id || m.asset)) {
-          markets.push({
-            market_id: String(m.market_id || id),
-            asset: String(m.asset || ''),
-            condition: String(m.condition || ''),
-            threshold: String(m.threshold || '0'),
-            resolution_timestamp: String(m.resolution_timestamp || '0'),
-            yes_pool: String(m.yes_pool || '0'),
-            no_pool: String(m.no_pool || '0'),
-            resolved: Boolean(m.resolved),
-            outcome: String(m.outcome || ''),
-          });
+        // Validate market data
+        if (m && typeof m === 'object' && Object.keys(m).length > 0) {
+          const hasValidData = m.market_id || m.asset || m.condition;
+          
+          if (hasValidData) {
+            markets.push({
+              market_id: String(m.market_id || marketId),
+              asset: String(m.asset || 'UNKNOWN'),
+              condition: String(m.condition || 'above'),
+              threshold: String(m.threshold || '0'),
+              resolution_timestamp: String(m.resolution_timestamp || '0'),
+              yes_pool: String(m.yes_pool || '0'),
+              no_pool: String(m.no_pool || '0'),
+              resolved: Boolean(m.resolved),
+              outcome: String(m.outcome || ''),
+            });
+            console.log(`[fetch] market ${marketId} added successfully`);
+          } else {
+            console.log(`[fetch] market ${marketId} has no valid data`);
+          }
+        } else {
+          console.log(`[fetch] market ${marketId} returned empty or invalid object`);
         }
       } catch (e) {
         console.error(`[fetch] market ${id} error:`, e);
       }
     }
+    
+    console.log(`[fetch] total markets found: ${markets.length}`);
     return markets.sort((a, b) => parseInt(b.market_id) - parseInt(a.market_id));
   } catch (e) {
     console.error('[fetch] markets error:', e);
@@ -203,7 +231,7 @@ async function fetchOdds(id: string): Promise<Odds> {
   }
 }
 
-// ============ WRITE OPERATIONS (via SDK writeContract) ============
+// ============ WRITE OPERATIONS ============
 async function createMarket(asset: string, condition: string, threshold: number, timestamp: number) {
   if (!writeClient) throw new Error('Wallet not connected');
 
@@ -290,6 +318,7 @@ export default function Page() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [markets, setMarkets] = useState<Market[]>([]);
   const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
 
@@ -298,6 +327,7 @@ export default function Page() {
   const [selectedMarket, setSelectedMarket] = useState<Market | null>(null);
 
   const knownCount = useRef(0);
+  const loadAttempts = useRef(0);
 
   const addToast = useCallback((type: Toast['type'], message: string) => {
     const id = Date.now();
@@ -311,41 +341,73 @@ export default function Page() {
     setToasts(prev => prev.filter(t => t.id !== id));
   }, []);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  // Main data loading function
+  const load = useCallback(async (showLoading = true) => {
+    if (showLoading) setLoading(true);
     setError(null);
+    
     try {
+      console.log('[load] fetching stats and markets...');
       const [s, m] = await Promise.all([fetchStats(), fetchMarkets()]);
+      
+      console.log('[load] stats:', s);
+      console.log('[load] markets:', m);
+      
       setStats(s);
       setMarkets(m);
       knownCount.current = s.total_markets;
+      loadAttempts.current = 0;
     } catch (e: any) {
       console.error('[load] error:', e);
+      setError('Failed to load data. Please refresh.');
     }
-    setLoading(false);
+    
+    if (showLoading) setLoading(false);
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  // Initial load
+  useEffect(() => { 
+    load(); 
+  }, [load]);
 
-  // Poll until new market appears after creation
-  const pollForNew = useCallback(async (prev: number) => {
-    for (let i = 1; i <= 15; i++) {
-      await new Promise(r => setTimeout(r, 2500));
+  // Poll for new market after creation with exponential backoff
+  const pollForNewMarket = useCallback(async (expectedCount: number): Promise<boolean> => {
+    setSyncing(true);
+    console.log(`[poll] looking for market count > ${expectedCount}`);
+    
+    // Exponential backoff: 2s, 3s, 4s, 5s, 6s, 7s, 8s, 9s, 10s (total ~54s)
+    const delays = [2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000];
+    
+    for (let i = 0; i < delays.length; i++) {
+      await new Promise(r => setTimeout(r, delays[i]));
+      
       try {
-        const s = await fetchStats();
-        console.log(`[poll] attempt ${i}: markets=${s.total_markets}, need>${prev}`);
-        if (s.total_markets > prev) {
-          const m = await fetchMarkets();
-          setStats(s);
-          setMarkets(m);
-          knownCount.current = s.total_markets;
+        console.log(`[poll] attempt ${i + 1}/${delays.length}`);
+        const newStats = await fetchStats();
+        console.log(`[poll] current markets: ${newStats.total_markets}, expected > ${expectedCount}`);
+        
+        if (newStats.total_markets > expectedCount) {
+          // Found new market! Fetch all markets now
+          console.log('[poll] new market detected! fetching markets...');
+          const newMarkets = await fetchMarkets();
+          
+          setStats(newStats);
+          setMarkets(newMarkets);
+          knownCount.current = newStats.total_markets;
+          setSyncing(false);
+          
           return true;
         }
       } catch (e) {
-        console.error(`[poll] attempt ${i} error:`, e);
+        console.error(`[poll] attempt ${i + 1} error:`, e);
       }
     }
-    await load();
+    
+    // Final attempt - force reload everything
+    console.log('[poll] timeout, forcing final reload...');
+    await load(false);
+    setSyncing(false);
+    
     return false;
   }, [load]);
 
@@ -399,27 +461,45 @@ export default function Page() {
     setShowCreate(true);
   };
 
+  // Called when market creation is complete
   const handleCreateSuccess = useCallback(async () => {
     setShowCreate(false);
-    addToast('success', 'Market created! Syncing...');
-    const prev = knownCount.current;
-    const found = await pollForNew(prev);
+    addToast('success', 'Market created! Syncing with blockchain...');
+    
+    const prevCount = knownCount.current;
+    const found = await pollForNewMarket(prevCount);
+    
     if (found) {
-      addToast('info', 'Market is now live');
+      addToast('info', 'Market is now live!');
+    } else {
+      addToast('info', 'Sync complete. Refresh if market not visible.');
     }
-  }, [addToast, pollForNew]);
+  }, [addToast, pollForNewMarket]);
 
   const handleBetSuccess = useCallback(async () => {
     setShowBet(false);
     setSelectedMarket(null);
-    addToast('success', 'Bet placed!');
+    addToast('success', 'Bet placed successfully!');
+    
+    // Wait and reload
     await new Promise(r => setTimeout(r, 3000));
-    await load();
+    await load(false);
   }, [addToast, load]);
 
   return (
     <div className="min-h-screen bg-[#0a0a0f]">
       <ToastContainer toasts={toasts} removeToast={removeToast} />
+
+      {/* Syncing Overlay */}
+      {syncing && (
+        <div className="fixed inset-0 z-40 bg-black/50 backdrop-blur-sm flex items-center justify-center">
+          <div className="bg-[#12121a] border border-white/10 rounded-2xl p-8 text-center max-w-sm mx-4">
+            <div className="w-16 h-16 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+            <h3 className="text-lg font-semibold mb-2">Syncing with Blockchain</h3>
+            <p className="text-zinc-400 text-sm">Please wait while we confirm your transaction...</p>
+          </div>
+        </div>
+      )}
 
       {/* Header */}
       <header className="fixed top-0 left-0 right-0 z-50 bg-[#0a0a0f]/90 backdrop-blur-md border-b border-white/5">
@@ -477,8 +557,8 @@ export default function Page() {
                 </span>
               </button>
               <button
-                onClick={load}
-                disabled={loading}
+                onClick={() => load()}
+                disabled={loading || syncing}
                 className="px-8 py-4 bg-white/5 hover:bg-white/10 border border-white/10 hover:border-white/20 rounded-2xl font-semibold transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50"
               >
                 <span className="flex items-center gap-2">
@@ -518,12 +598,22 @@ export default function Page() {
             ))}
           </div>
 
-          {/* Markets */}
+          {/* Markets Section */}
           <div className="mb-8">
-            <h2 className="text-2xl font-bold mb-2">Prediction Markets</h2>
-            <p className="text-zinc-500">Click on a market to place your bet</p>
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-2xl font-bold mb-2">Prediction Markets</h2>
+                <p className="text-zinc-500">Click on a market to place your bet</p>
+              </div>
+              {markets.length > 0 && (
+                <span className="px-3 py-1 bg-indigo-500/20 text-indigo-400 rounded-full text-sm font-medium">
+                  {markets.length} Market{markets.length !== 1 ? 's' : ''}
+                </span>
+              )}
+            </div>
           </div>
 
+          {/* Market List */}
           {loading ? (
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
               {[1,2,3].map(i => (
@@ -730,7 +820,7 @@ function CreateModal({ onClose, onSuccess, addToast }: {
           </div>
           <button
             onClick={onSuccess}
-            className="w-full py-4 bg-gradient-to-r from-indigo-500 to-purple-500 rounded-xl font-semibold"
+            className="w-full py-4 bg-gradient-to-r from-indigo-500 to-purple-500 rounded-xl font-semibold hover:from-indigo-600 hover:to-purple-600 transition-all"
           >
             View Markets
           </button>
